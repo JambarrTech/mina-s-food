@@ -1,0 +1,6 @@
+{
+  "name": "Mina's Food - Pâtisserie & Boulangerie Mbour",
+  "description": "Mina's Food à Mbour : pâtisserie fine, gâteaux sur-mesure d'anniversaire, viennoiseries et délices artisanaux. Qualité, fraîcheur, passion et paiement direct Wave au 77 407 81 20.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
