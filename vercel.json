@@ -1,13 +1,14 @@
 {
-  "version": 2,
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "npm run build",
-  "builds": [
-    { "src": "api/index.ts", "use": "@vercel/node" },
-    { "src": "dist/**", "use": "@vercel/static" }
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/(.*)", "destination": "/index.html" }
   ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/index.ts" },
-    { "handlers": ["filesystem"] },
-    { "src": "/(.*)", "dest": "/dist/index.html" }
-  ]
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 30
+    }
+  }
 }
