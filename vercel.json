@@ -9,10 +9,5 @@
     { "src": "/api/(.*)", "dest": "/api/index.ts" },
     { "handlers": ["filesystem"] },
     { "src": "/(.*)", "dest": "/dist/index.html" }
-  ],
-  "functions": {
-    "api/index.ts": {
-      "maxDuration": 30
-    }
-  }
+  ]
 }
