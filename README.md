@@ -102,7 +102,7 @@ L'application est prête pour Vercel + Neon (PostgreSQL serverless). Le mode est
 
 ### Structure du build
 
-- `npm run build` (exécuté par Vercel) produit `dist/` (frontend) + `dist/server.cjs` (bundle backend).
+- `npm run build` (exécuté par Vercel) produit `dist/` (frontend) + `dist-server/server.cjs` (bundle backend, non exposé).
 - `api/index.ts` importe et exporte l'application Express ; Vercel le monte via `@vercel/node`.
 - `vercel.json` route `/api/*` vers la fonction Node et sert les fichiers statiques depuis `dist/`.
 
@@ -113,7 +113,7 @@ Au premier démarrage avec `DATABASE_URL`, le serveur crée automatiquement les 
 ### Commande locale avec l'override Vercel
 
 ```bash
-VERCEL=1 PORT=3999 node dist/server.cjs
+VERCEL=1 PORT=3999 node dist-server/server.cjs
 ```
 
 ## Fonctionnalités

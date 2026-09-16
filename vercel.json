@@ -1,16 +1,5 @@
 {
-  "version": 2,
-  "buildCommand": "npm run build",
-  "builds": [
-    { "src": "api/index.ts", "use": "@vercel/node" },
-    { "src": "dist/**", "use": "@vercel/static" }
-  ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1" },
-    { "src": "/assets/(.*)", "dest": "/dist/assets/$1" },
-    { "src": "/logo.jpeg", "dest": "/dist/logo.jpeg" },
-    { "src": "/wave-logo.png", "dest": "/dist/wave-logo.png" },
-    { "src": "/sw.js", "dest": "/dist/sw.js" },
-    { "src": "/(.*)", "dest": "/dist/index.html" }
-  ]
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "npm run build"
 }
