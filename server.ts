@@ -1861,7 +1861,8 @@ function listenOnAvailablePort(startPort: number): Promise<number> {
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
+    const VITE_SERVER_MODULE = 'vite';
+    const { createServer: createViteServer } = await import(/* @vite-ignore */ VITE_SERVER_MODULE);
     const vite = await createViteServer({
       server: {
         middlewareMode: true,

@@ -2,10 +2,19 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig} from 'vite';
+import vercel from 'vite-plugin-vercel';
 
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [react(), tailwindcss(), vercel()],
+    vercel: {
+      defaultMaxDuration: 30,
+      defaultSupportsResponseStreaming: true,
+      rewrites: [
+        {source: '/api/:path*', destination: '/api/:path*'},
+        {source: '/:path*', destination: '/index.html'},
+      ],
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
