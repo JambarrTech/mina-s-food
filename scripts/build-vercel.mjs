@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, '.vercel', 'output');
-const fnDir = join(outDir, 'functions', 'api');
+const fnDir = join(outDir, 'functions', 'api.func');
 const staticDir = join(outDir, 'static');
 const distDir = join(root, 'dist');
 
