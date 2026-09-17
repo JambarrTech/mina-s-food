@@ -13,7 +13,7 @@ interface Props {
   onCustomizeCake: (product: Product) => void;
 }
 
-export const ProductCard: React.FC<Props> = ({
+export const ProductCard: React.FC<Props> = React.memo(({
   product,
   onAddToCart,
   onCustomizeCake
@@ -115,4 +115,4 @@ export const ProductCard: React.FC<Props> = ({
       </div>
     </div>
   );
-};
+});

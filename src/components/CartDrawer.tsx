@@ -68,12 +68,30 @@ export const CartDrawer: React.FC<Props> = ({
   const [customerAddress, setCustomerAddress] = useState<string>('');
   const [customerNotes, setCustomerNotes] = useState<string>('');
   
-  // Date et créneau souhaités
-  const [requestedDate, setRequestedDate] = useState<string>('Aujourd’hui');
+  // Date et créneau souhaités avec calcul dynamique
+  const getDynamicDates = () => {
+    const today = new Date();
+    const days = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+    const dates = [
+      { value: 'Aujourd\'hui', label: 'Aujourd\'hui' },
+      { value: 'Demain', label: 'Demain' },
+    ];
+    // Ajouter les 5 prochains jours
+    for (let i = 2; i <= 5; i++) {
+      const d = new Date(today);
+      d.setDate(today.getDate() + i);
+      dates.push({ value: days[d.getDay()], label: `Ce ${days[d.getDay()]} ${d.getDate()}/${d.getMonth() + 1}` });
+    }
+    return dates;
+  };
+  const dynamicDates = getDynamicDates();
+
+  const [requestedDate, setRequestedDate] = useState<string>('Aujourd\'hui');
   const [requestedTime, setRequestedTime] = useState<string>('Dès que possible (30-45 min)');
   
   // Erreurs de validation
   const [formErrors, setFormErrors] = useState<{ name?: string; phone?: string; address?: string }>({});
+  const [isCheckingOut, setIsCheckingOut] = useState<boolean>(false);
 
   if (!isOpen) return null;
 
@@ -102,6 +120,7 @@ export const CartDrawer: React.FC<Props> = ({
     }
 
     setFormErrors({});
+    setIsCheckingOut(true);
     onProceedToWaveCheckout({
       customerName,
       customerPhone,
@@ -122,6 +141,9 @@ export const CartDrawer: React.FC<Props> = ({
     <div 
       id="cart-drawer-backdrop" 
       className="fixed inset-0 z-50 flex justify-end bg-stone-900/60 backdrop-blur-xs transition-opacity animate-fadeIn"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Panier"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -241,16 +263,18 @@ export const CartDrawer: React.FC<Props> = ({
                           type="button"
                           onClick={() => onUpdateQuantity(item.cartItemId, item.quantity - 1)}
                           className="w-6 h-6 rounded-md bg-stone-100 hover:bg-stone-200 text-stone-700 flex items-center justify-center transition-colors cursor-pointer"
+                          aria-label={`Diminuer la quantité de ${item.product.name}`}
                         >
                           <Minus className="w-3 h-3" />
                         </button>
-                        <span className="text-xs font-bold w-4 text-center">
+                        <span className="text-xs font-bold w-4 text-center" aria-label={`Quantité: ${item.quantity}`}>
                           {item.quantity}
                         </span>
                         <button
                           type="button"
                           onClick={() => onUpdateQuantity(item.cartItemId, item.quantity + 1)}
                           className="w-6 h-6 rounded-md bg-stone-100 hover:bg-stone-200 text-stone-700 flex items-center justify-center transition-colors cursor-pointer"
+                          aria-label={`Augmenter la quantité de ${item.product.name}`}
                         >
                           <Plus className="w-3 h-3" />
                         </button>
@@ -302,10 +326,11 @@ export const CartDrawer: React.FC<Props> = ({
                 {/* Si livraison : sélection de la zone */}
                 {deliveryType === 'livraison_mbour' && (
                   <div className="space-y-2 p-3 rounded-xl bg-stone-50 border border-stone-200">
-                    <label className="block text-xs font-semibold text-stone-700">
+                    <label htmlFor="cart-delivery-zone" className="block text-xs font-semibold text-stone-700">
                       Secteur / Quartier de livraison
                     </label>
                     <select
+                      id="cart-delivery-zone"
                       value={selectedZoneId}
                       onChange={(e) => setSelectedZoneId(e.target.value)}
                       className="w-full px-3 py-2 rounded-lg border border-stone-300 bg-white text-xs text-stone-800 focus:outline-none focus:ring-2 focus:ring-amber-500"
@@ -388,27 +413,27 @@ export const CartDrawer: React.FC<Props> = ({
                 {/* Date & Heure souhaitées */}
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-xs font-medium text-stone-700 mb-1 flex items-center gap-1">
+                    <label htmlFor="cart-requested-date" className="block text-xs font-medium text-stone-700 mb-1 flex items-center gap-1">
                       <Calendar className="w-3 h-3 text-stone-500" /> Date
                     </label>
                     <select
+                      id="cart-requested-date"
                       value={requestedDate}
                       onChange={(e) => setRequestedDate(e.target.value)}
                       className="w-full px-2.5 py-1.5 rounded-lg border border-stone-300 bg-white text-xs focus:outline-none focus:ring-2 focus:ring-amber-500"
                     >
-                      <option value="Aujourd’hui">Aujourd’hui</option>
-                      <option value="Demain">Demain</option>
-                      <option value="Vendredi">Ce Vendredi</option>
-                      <option value="Samedi">Ce Samedi (Fête)</option>
-                      <option value="Dimanche">Ce Dimanche</option>
+                      {dynamicDates.map(d => (
+                        <option key={d.value} value={d.value}>{d.label}</option>
+                      ))}
                     </select>
                   </div>
 
                   <div>
-                    <label className="block text-xs font-medium text-stone-700 mb-1 flex items-center gap-1">
+                    <label htmlFor="cart-requested-time" className="block text-xs font-medium text-stone-700 mb-1 flex items-center gap-1">
                       <Clock className="w-3 h-3 text-stone-500" /> Heure
                     </label>
                     <select
+                      id="cart-requested-time"
                       value={requestedTime}
                       onChange={(e) => setRequestedTime(e.target.value)}
                       className="w-full px-2.5 py-1.5 rounded-lg border border-stone-300 bg-white text-xs focus:outline-none focus:ring-2 focus:ring-amber-500"
@@ -467,9 +492,10 @@ export const CartDrawer: React.FC<Props> = ({
               id="proceed-to-wave-btn"
               type="button"
               onClick={handleCheckoutClick}
-              className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-[#00b2fe] to-[#0090d8] hover:from-[#00a1e6] hover:to-[#007cb8] text-white font-bold text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
+              disabled={isCheckingOut}
+              className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-[#00b2fe] to-[#0090d8] hover:from-[#00a1e6] hover:to-[#007cb8] text-white font-bold text-sm shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <span>Payer avec Wave ({total.toLocaleString('fr-FR')} FCFA)</span>
+              <span>{isCheckingOut ? 'Préparation...' : `Payer avec Wave (${total.toLocaleString('fr-FR')} FCFA)`}</span>
               <ArrowRight className="w-4 h-4" />
             </button>
           </div>

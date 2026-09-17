@@ -10,7 +10,7 @@
  * - Paramètres de la pâtisserie
  */
 
-import { Product, Order, OrderStatus, DeliveryZone, BakerySettings } from '../types/bakery.ts';
+import { Product, Order, OrderStatus, DeliveryZone, BakerySettings, Invoice } from '../types/bakery.ts';
 
 const ADMIN_TOKEN_KEY = 'minas_food_admin_token';
 
@@ -67,7 +67,9 @@ async function requeteApi<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error(message);
   }
 
-  return data as T;
+  // Strip the `success` field to return only the payload
+  const { success: _, ...payload } = data;
+  return payload as T;
 }
 
 // ==========================================
@@ -150,15 +152,16 @@ export async function trouverCommandeParNumero(code: string, telephone: string):
     const query = `?phone=${encodeURIComponent(telephone.trim())}`;
     const data = await requeteApi<{ order: Order }>(`/api/orders/${encodeURIComponent(code.trim())}${query}`);
     return data.order || null;
-  } catch (erreur: any) {
-    if (erreur?.message?.includes('introuvable') || erreur?.message?.includes('404')) {
+  } catch (erreur: unknown) {
+    const msg = erreur instanceof Error ? erreur.message : String(erreur);
+    if (msg.includes('404') || msg.includes('introuvable')) {
       return null;
     }
     throw erreur;
   }
 }
 
-export async function chargerFacture(commandeId: string, telephone: string): Promise<any> {
+export async function chargerFacture(commandeId: string, telephone: string): Promise<Invoice> {
   const query = `?phone=${encodeURIComponent(telephone.trim())}`;
   const data = await requeteApi<{ invoice: any }>(`/api/invoices/${encodeURIComponent(commandeId)}${query}`);
   return data.invoice;

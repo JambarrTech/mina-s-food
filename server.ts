@@ -32,6 +32,7 @@ const VITE_HMR_PORT = Number(process.env.VITE_HMR_PORT || 24678);
 
 let server: http.Server | null = null;
 let wss: WebSocketServer | null = null;
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
 // Clients Server-Sent Events : temps réel aussi en mode serverless Vercel
 // (le WebSocket global n'existe pas entre plusieurs instances de fonctions).
@@ -52,7 +53,7 @@ function enqueueRealtimeEvent(event: string, payload: unknown, timestamp: string
 
 // Diffusion des événements temps réel : WebSocket (dev) + SSE (Vercel)
 // + notifications natives (push) même quand l'onglet est fermé.
-function broadcastRealtimeEvent(event: string, payload: any, push?: { title: string; message: string; type?: string; orderNumber?: string; url?: string }) {
+function broadcastRealtimeEvent(event: string, payload: Record<string, unknown>, push?: { title: string; message: string; type?: string; orderNumber?: string; url?: string }) {
   const timestamp = new Date().toISOString();
   const id = enqueueRealtimeEvent(event, payload, timestamp);
   // L'identifiant est injecté dans le payload pour permettre au client de
@@ -86,7 +87,7 @@ function broadcastRealtimeEvent(event: string, payload: any, push?: { title: str
 
   // Envoi simultané d'une notification native (arrière-plan / onglet fermé)
   if (push) {
-    sendPushToAll(push.title, push.message, push as any).catch(() => {});
+    sendPushToAll(push.title, push.message, push).catch(() => {});
   }
 }
 
@@ -96,13 +97,13 @@ if (!IS_VERCEL) {
   wss = new WebSocketServer({ server, path: '/api/ws' });
 
   // Gestion des connexions WebSocket et heartbeat
-  wss.on('connection', (ws: any) => {
-    ws.isAlive = true;
+  wss.on('connection', (ws: WebSocket) => {
+    (ws as any).isAlive = true;
+    (ws as any).isAdmin = false;
     ws.on('pong', () => {
-      ws.isAlive = true;
+      (ws as any).isAlive = true;
     });
 
-    // Message de bienvenue avec statistiques
     ws.send(JSON.stringify({
       event: 'connection:established',
       data: {
@@ -112,21 +113,28 @@ if (!IS_VERCEL) {
       }
     }));
 
-    ws.on('message', (messageRaw: any) => {
+    ws.on('message', (messageRaw: WebSocket.Data) => {
       try {
-        const parsed = JSON.parse(messageRaw.toString());
+        const parsed = JSON.parse(String(messageRaw));
         if (parsed.event === 'ping') {
           ws.send(JSON.stringify({ event: 'pong', timestamp: Date.now() }));
+        }
+        if (parsed.event === 'auth:admin' && parsed.token) {
+          const expiresAt = adminSessions.get(parsed.token);
+          if (expiresAt && expiresAt > Date.now()) {
+            (ws as any).isAdmin = true;
+            ws.send(JSON.stringify({ event: 'auth:success', data: { role: 'admin' } }));
+          }
         }
       } catch {}
     });
   });
 
   // Nettoyage régulier des connexions mortes (toutes les 30s)
-  const heartbeatInterval = setInterval(() => {
-    wss!.clients.forEach((ws: any) => {
-      if (ws.isAlive === false) return ws.terminate();
-      ws.isAlive = false;
+  heartbeatInterval = setInterval(() => {
+    wss!.clients.forEach((ws: WebSocket) => {
+      if ((ws as any).isAlive === false) return ws.terminate();
+      (ws as any).isAlive = false;
       ws.ping();
     });
   }, 30000);
@@ -137,15 +145,17 @@ if (!IS_VERCEL) {
 }
 
 app.use(express.json({
+  limit: '1mb',
   verify: (req: Request, _res: Response, buf: Buffer) => {
-    (req as any).rawBody = buf;
+    (req as { rawBody?: Buffer }).rawBody = buf;
   }
 }));
 
+// Trust proxy pour rate limiter correct derrière Vercel/Cloudflare (#14)
+app.set('trust proxy', 1);
+
 // ============================================================================
-// CORS explicite : l'application est servie sur la même origine, on n'autorise
-// donc que les origines déclarées (ALLOWED_ORIGINS, séparées par des virgules).
-// Les appels serveur-à-serveur (webhook Wave) n'ont pas d'origine et passent.
+// CORS explicite + Security Headers
 // ============================================================================
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -153,13 +163,25 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean);
 
 app.use((req: Request, res: Response, next: () => void) => {
+  // Security headers (#34, #35, #36)
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  if (!IS_VERCEL) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+
   const origin = req.header('origin');
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Wave-Signature');
+    // Credentials only for same-origin admin endpoints, not public Wave webhook
+    if (req.path.startsWith('/api/admin')) {
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
   }
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
@@ -209,7 +231,11 @@ if (pool) {
     console.warn('[DB] Erreur de pool inactif :', err?.message || err);
   });
 }
-const adminPin = (process.env.ADMIN_PIN || process.env.VITE_ADMIN_PIN || 'mina2026').trim();
+const adminPin = (process.env.ADMIN_PIN || '').trim();
+if (!adminPin) {
+  console.error('[SECURITY] ADMIN_PIN non défini. Le serveur refuse de démarrer sans PIN explicite.');
+  if (!IS_VERCEL) process.exit(1);
+}
 
 // Informations légales de la boutique. Déclarées tôt car utilisées par le
 // seed de démonstration et la génération de factures (évite toute référence
@@ -234,7 +260,7 @@ const SELLER_INFO = {
 // ============================================================================
 const SESSIONS_FILE = path.join(process.cwd(), '.admin-sessions.json');
 const adminSessions = new Map<string, number>();
-const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const ADMIN_SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 heures max (#31)
 
 async function ensureAdminSessionsTable() {
   if (!pool) return;
@@ -307,6 +333,22 @@ function persistAdminSessions() {
   syncAdminSessionsDb();
 }
 
+// Graceful shutdown handler (#76)
+function gracefulShutdown(signal: string) {
+  console.log(`[Mina's Food] ${signal} reçu, arrêt gracieux...`);
+  clearInterval(heartbeatInterval);
+  clearInterval(rateLimitCleanupInterval);
+  clearInterval(sessionCleanupInterval);
+  if (wss) {
+    wss.clients.forEach((ws: WebSocket) => ws.close(1001, 'Server shutting down'));
+    wss.close();
+  }
+  if (server) {
+    server.close(() => process.exit(0));
+  }
+  setTimeout(() => process.exit(0), 5000);
+}
+
 async function requireAdmin(req: Request, res: Response, next: () => void) {
   const authorization = req.header('authorization') || '';
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
@@ -339,7 +381,8 @@ async function requireAdmin(req: Request, res: Response, next: () => void) {
 loadAdminSessions();
 loadAdminSessionsDb();
 // Nettoie périodiquement les sessions expirées de la mémoire et du disque/base
-setInterval(persistAdminSessions, 60 * 60 * 1000).unref?.();
+const sessionCleanupInterval = setInterval(persistAdminSessions, 60 * 60 * 1000);
+if (sessionCleanupInterval.unref) sessionCleanupInterval.unref();
 
 // ============================================================================
 // Notifications Push Web (Service Worker + VAPID) - PWA Mina's Food
@@ -360,8 +403,14 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   pushEnabled = true;
 }
 
+interface PushSubscription {
+  endpoint: string;
+  expirationTime: number | null;
+  keys: { p256dh: string; auth: string };
+}
+
 const PUSH_SUBSCRIPTIONS_FILE = path.join(process.cwd(), '.push-subscriptions.json');
-const pushSubscriptions: any[] = [];
+const pushSubscriptions: PushSubscription[] = [];
 
 function loadPushSubscriptions() {
   try {
@@ -376,8 +425,8 @@ function loadPushSubscriptions() {
 function persistPushSubscriptions() {
   try {
     fs.writeFileSync(PUSH_SUBSCRIPTIONS_FILE, JSON.stringify(pushSubscriptions), { mode: 0o600 });
-  } catch (err) {
-    console.warn('[Push] Persistance des abonnements impossible :', err);
+  } catch {
+    // Fichier non accessible en écriture : on continue en mémoire uniquement
   }
 }
 
@@ -395,19 +444,22 @@ async function loadDbPushSubscriptions() {
   }
 }
 
-function isValidPushSubscription(sub: any): boolean {
+function isValidPushSubscription(sub: unknown): sub is PushSubscription {
   return Boolean(
     sub &&
     typeof sub === 'object' &&
-    typeof sub.endpoint === 'string' &&
-    sub.endpoint.startsWith('https://') &&
-    sub.keys &&
-    typeof sub.keys.p256dh === 'string' &&
-    typeof sub.keys.auth === 'string'
+    'endpoint' in sub &&
+    typeof (sub as PushSubscription).endpoint === 'string' &&
+    (sub as PushSubscription).endpoint.startsWith('https://') &&
+    'keys' in sub &&
+    typeof (sub as PushSubscription).keys === 'object' &&
+    (sub as PushSubscription).keys !== null &&
+    typeof (sub as PushSubscription).keys.p256dh === 'string' &&
+    typeof (sub as PushSubscription).keys.auth === 'string'
   );
 }
 
-async function addPushSubscription(subscription: any) {
+async function addPushSubscription(subscription: unknown) {
   if (!isValidPushSubscription(subscription)) {
     return { error: 'Abonnement push invalide.', status: 400 };
   }
@@ -468,7 +520,7 @@ async function sendPushToAll(title: string, message: string, extras: { type?: st
   let sent = 0;
   const invalid: string[] = [];
 
-  await Promise.all(pushSubscriptions.map(async (subscription) => {
+  await Promise.all(pushSubscriptions.map(async (subscription: PushSubscription) => {
     try {
       await webPush.sendNotification(subscription, payload);
       sent += 1;
@@ -570,7 +622,7 @@ function rateLimitedHandler(
   };
 }
 
-setInterval(() => {
+const rateLimitCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [key, bucket] of rateBuckets) {
     if (bucket.resetAt <= now) rateBuckets.delete(key);
@@ -578,7 +630,8 @@ setInterval(() => {
   if (pool) {
     pool.query('DELETE FROM rate_limits WHERE reset_at <= $1', [now]).catch(() => {});
   }
-}, 60_000).unref?.();
+}, 60_000);
+if (rateLimitCleanupInterval.unref) rateLimitCleanupInterval.unref();
 
 // ============================================================================
 // Verrouillage anti-bruteforce du backoffice, côté serveur et par adresse IP
@@ -695,7 +748,8 @@ const demoZones = [
   { id: 'zone-somone-ngaparou', name: 'Ngaparou & Somone Plage', fee: 2000, estimatedMinutes: 45, isActive: true }
 ];
 
-const demoOrders: any[] = [];
+const MAX_DEMO_ORDERS = 200;
+const demoOrders: Record<string, unknown>[] = [];
 
 // ============================================================================
 // Auto-init de la base (base Neon neuve : tables serverless + seed catalogue)
@@ -795,7 +849,9 @@ function persistRealtimeEventDb(id: string, event: string, payload: unknown, tim
     `INSERT INTO realtime_events (id, event, payload, created_at) VALUES ($1, $2, $3, $4)
      ON CONFLICT (id) DO NOTHING`,
     [id, event, JSON.stringify(payload), timestamp]
-  ).catch(() => {});
+  ).catch((err) => {
+    console.warn('[Realtime] Persistance événement impossible :', err?.message || err);
+  });
 }
 
 async function listRecentEventsDb(): Promise<Array<{ id: string; event: string; data: unknown; timestamp: string }>> {
@@ -815,7 +871,9 @@ async function listRecentEventsDb(): Promise<Array<{ id: string; event: string; 
   }
 }
 
-ensureDatabaseState().catch(() => {});
+ensureDatabaseState().catch((err) => {
+  console.warn("[Mina's Food] Initialisation de la base impossible au démarrage :", err?.message || err);
+});
 
 function getDemoProduct(productId: string) {
   return demoProducts.find(product => product.id === productId);
@@ -832,13 +890,20 @@ async function validateOrderPayload(orderData: any) {
   if (!allowedPaymentMethods.includes(orderData.paymentMethod)) throw new Error('Mode de paiement invalide.');
   if (!Array.isArray(orderData.items) || orderData.items.length === 0) throw new Error('La commande doit contenir au moins un article.');
 
+  // Batch fetch products to avoid N+1 queries (#17)
+  const productIds = orderData.items.map((item: { product?: { id?: string } }) => item.product?.id).filter(Boolean);
+  let dbProducts: Map<string, Record<string, unknown>> = new Map();
+  if (pool && productIds.length > 0) {
+    const { rows } = await pool.query('SELECT * FROM products WHERE id = ANY($1::text[])', [productIds]);
+    for (const row of rows) dbProducts.set(row.id, mapProduct(row));
+  }
+
   const items = await Promise.all(orderData.items.map(async (item: any) => {
     const quantity = Number(item.quantity);
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) throw new Error('Quantité d’article invalide.');
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) throw new Error('Quantité d\'article invalide.');
     let product = getDemoProduct(item.product?.id);
-    if (pool && item.product?.id) {
-      const { rows } = await pool.query('SELECT * FROM products WHERE id = $1 LIMIT 1', [item.product.id]);
-      product = rows[0] ? mapProduct(rows[0]) : undefined;
+    if (dbProducts.has(item.product?.id)) {
+      product = dbProducts.get(item.product?.id) as typeof product;
     }
     if (!product?.id || !String(product.name || '').trim()) throw new Error('Produit de commande invalide.');
     const basePrice = Number(product.price);
@@ -865,6 +930,12 @@ async function validateOrderPayload(orderData: any) {
 
   const total = subtotal + deliveryFee;
   return { ...orderData, items, subtotal, deliveryFee, total };
+}
+
+function safeDbError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (DB_RETRYABLE_ERROR.test(msg)) return 'Service temporairement indisponible. Veuillez réessayer.';
+  return 'Erreur interne du serveur.';
 }
 
 async function ensureDb(): Promise<boolean> {
@@ -1099,11 +1170,11 @@ async function upsertSettings(s: any) {
 }
 
 // --- Commandes ---
-async function listOrders() {
+async function listOrders(limit = 200, offset = 0) {
   if (!pool) {
     return demoOrders;
   }
-  const { rows } = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT * FROM orders ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
   const orders = rows.map(mapOrder);
   if (orders.length === 0) return orders;
 
@@ -1119,7 +1190,7 @@ async function listOrders() {
 
 async function getOrderByIdentifier(identifier: string) {
   if (!pool) {
-    return demoOrders.find(order => order.id === identifier || order.orderNumber.toUpperCase() === identifier.toUpperCase()) || null;
+    return demoOrders.find(order => order.id === identifier || String(order.orderNumber || '').toUpperCase() === identifier.toUpperCase()) || null;
   }
   const { rows } = await pool.query(
     'SELECT * FROM orders WHERE id = $1 OR UPPER(order_number) = UPPER($1) LIMIT 1',
@@ -1138,7 +1209,7 @@ async function createOrder(orderData: any) {
     const now = new Date().toISOString();
     const order = {
       ...validated,
-      id: validated.id || `ord-${Date.now()}`,
+      id: validated.id || `ord-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
       orderNumber: validated.orderNumber || `MINA-${Math.floor(1000 + Math.random() * 9000)}`,
       paymentStatus: validated.paymentStatus || (validated.paymentMethod === 'wave' ? 'pending' : 'pending'),
       status: validated.status || 'received',
@@ -1146,9 +1217,10 @@ async function createOrder(orderData: any) {
       updatedAt: now
     };
     demoOrders.unshift(order);
+    if (demoOrders.length > MAX_DEMO_ORDERS) demoOrders.pop();
     return { order, orderNumber: order.orderNumber, orderId: order.id };
   }
-  const orderId = validated.id || `ord-${Date.now()}`;
+  const orderId = validated.id || `ord-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const orderNumber = validated.orderNumber || `MINA-${Math.floor(1000 + Math.random() * 9000)}`;
 
   const client = await pool.connect();
@@ -1307,7 +1379,7 @@ async function saveInvoice(order: any) {
 // Helper pour générer les données de facture
 function buildInvoiceObject(order: any) {
   const cleanOrderCode = (order.orderNumber || order.id).replace(/[^A-Z0-9]/gi, '');
-  const invoiceNumber = `FACT-2026-${cleanOrderCode}`;
+  const invoiceNumber = `FACT-${new Date().getFullYear()}-${cleanOrderCode}`;
 
   const items = (order.items || []).map((item: any) => {
     let details = '';
@@ -1335,7 +1407,7 @@ function buildInvoiceObject(order: any) {
     };
   });
 
-  const verificationCode = `VERIF-${order.id.slice(0, 6).toUpperCase()}-${((order.total || 0) % 9999).toString().padStart(4, '0')}`;
+  const verificationCode = `VERIF-${order.id.slice(0, 6).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
   return {
     id: `inv-${order.id}`,
@@ -1579,13 +1651,27 @@ app.get('/api/admin/session', requireAdmin, (_req: Request, res: Response) => {
   res.json({ success: true, authenticated: true });
 });
 
+// Déconnexion admin (#32) : invalide le token côté serveur
+app.post('/api/admin/logout', requireAdmin, (req: Request, res: Response) => {
+  const authorization = req.header('authorization') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+  if (token) {
+    adminSessions.delete(token);
+    persistAdminSessions();
+    if (pool) {
+      pool.query('DELETE FROM admin_sessions WHERE token = $1', [token]).catch(() => {});
+    }
+  }
+  res.json({ success: true, message: 'Session déconnectée.' });
+});
+
 // 1.2 Liste des commandes
 app.get('/api/orders', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const orders = await listOrders();
     res.json({ success: true, count: orders.length, orders });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 });
 
@@ -1630,7 +1716,7 @@ app.post('/api/orders', rateLimitedHandler(async (req: Request, res: Response) =
       }
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Erreur interne du serveur.' });
   }
 }, { max: 20 }));
 
@@ -1652,7 +1738,7 @@ app.get('/api/orders/:orderId', rateLimitedHandler(async (req: Request, res: Res
     }
     res.json({ success: true, order });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 }, { max: 100 }));
 
@@ -1697,7 +1783,7 @@ app.patch('/api/orders/:orderId/status', requireAdmin, async (req: Request, res:
 
     res.json({ success: true, order });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 });
 
@@ -1742,7 +1828,7 @@ app.patch('/api/orders/:orderId/payment', requireAdmin, async (req: Request, res
 
     res.json({ success: true, order });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 });
 
@@ -1756,7 +1842,7 @@ app.get('/api/products', rateLimitedHandler(async (_req: Request, res: Response)
     const products = await listProducts();
     res.json({ success: true, count: products.length, products });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 }, { max: 200 }));
 
@@ -1774,7 +1860,7 @@ app.post('/api/products', requireAdmin, async (req: Request, res: Response) => {
     await upsertProduct(product);
     res.json({ success: true, product });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Erreur interne du serveur.' });
   }
 });
 
@@ -1784,7 +1870,7 @@ app.delete('/api/products/:productId', requireAdmin, async (req: Request, res: R
     await deleteProduct(req.params.productId);
     res.json({ success: true, id: req.params.productId });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Erreur interne du serveur.' });
   }
 });
 
@@ -1794,7 +1880,7 @@ app.get('/api/delivery-zones', rateLimitedHandler(async (_req: Request, res: Res
     const zones = await listZones();
     res.json({ success: true, count: zones.length, zones });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 }, { max: 200 }));
 
@@ -1811,7 +1897,7 @@ app.put('/api/delivery-zones', requireAdmin, async (req: Request, res: Response)
     const zones = await listZones();
     res.json({ success: true, zones });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Erreur interne du serveur.' });
   }
 });
 
@@ -1824,7 +1910,7 @@ app.get('/api/settings', rateLimitedHandler(async (_req: Request, res: Response)
     }
     res.json({ success: true, settings });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 }, { max: 200 }));
 
@@ -1838,7 +1924,7 @@ app.put('/api/settings', requireAdmin, async (req: Request, res: Response) => {
     await upsertSettings(settings);
     res.json({ success: true, settings });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Erreur interne du serveur.' });
   }
 });
 
@@ -1866,7 +1952,7 @@ app.get('/api/invoices/:orderId', rateLimitedHandler(async (req: Request, res: R
     const invoice = buildInvoiceObject(order);
     res.json({ success: true, invoice });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+    res.status(503).json({ success: false, error: safeDbError(err) });
   }
 }, { max: 100 }));
 
@@ -1885,7 +1971,7 @@ app.get('/api/invoices/:orderId/html', rateLimitedHandler(async (req: Request, r
         <html>
           <body style="font-family: sans-serif; text-align: center; padding: 50px;">
             <h2>Facture introuvable</h2>
-            <p>La référence ${orderId} n'existe pas ou a expiré.</p>
+            <p>Cette référence n'existe pas ou a expiré.</p>
             <a href="/">Retour à la boutique Mina's Food</a>
           </body>
         </html>
@@ -1898,7 +1984,7 @@ app.get('/api/invoices/:orderId/html', rateLimitedHandler(async (req: Request, r
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
   } catch (err: any) {
-    res.status(503).send('Base de données indisponible');
+    res.status(503).send('Service temporairement indisponible.');
   }
 }, { max: 100 }));
 
@@ -2336,6 +2422,8 @@ export default app;
 
 // En local (développement et node dist/server.cjs), démarre le vrai serveur.
 if (!IS_VERCEL) {
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   startServer().catch((err) => {
     console.error('[Mina\'s Food Server] Échec du démarrage :', err);
     process.exit(1);

@@ -12,7 +12,7 @@
  * - Imprimer les bons de préparation pour le laboratoire.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { 
   Order, 
   Product, 
@@ -65,6 +65,8 @@ import { BakeryLogo } from './BakeryLogo.tsx';
 import { realtimeService } from '../services/realtimeService.ts';
 import { sanitizeInput } from '../utils/securityUtils.ts';
 
+const DEFAULT_PRODUCT_IMAGE = 'https://images.unsplash.com/photo-1578985545062-69928b1d9587?auto=format&fit=crop&w=900&q=80';
+
 interface Props {
   orders: Order[];
   products: Product[];
@@ -104,15 +106,23 @@ export const BackofficeView: React.FC<Props> = ({
     category: 'gateaux',
     description: '',
     price: 10000,
-    image: 'https://images.unsplash.com/photo-1578985545062-69928b1d9587?auto=format&fit=crop&w=900&q=80',
+    image: DEFAULT_PRODUCT_IMAGE,
     isAvailable: true,
     isCustomizable: true,
     preparationTime: 'Sur commande (24h)'
   });
 
-  // Paramètres modifiés
+  // Paramètres modifiés — resynchronisés si les props changent
   const [settingsForm, setSettingsForm] = useState<BakerySettings>({ ...settings });
   const [zonesForm, setZonesForm] = useState<DeliveryZone[]>([...deliveryZones]);
+
+  useEffect(() => {
+    setSettingsForm({ ...settings });
+  }, [settings]);
+
+  useEffect(() => {
+    setZonesForm([...deliveryZones]);
+  }, [deliveryZones]);
   const [notificationMessage, setNotificationMessage] = useState<string>('');
 
   // Centre de diffusion Push en temps réel
@@ -121,11 +131,19 @@ export const BackofficeView: React.FC<Props> = ({
   const [broadcastBody, setBroadcastBody] = useState<string>('Nos pâtisseries fraîches viennent d\'être enfournées à Mbour. Venez vous régaler !');
   const [isSendingBroadcast, setIsSendingBroadcast] = useState<boolean>(false);
 
-  // Notification flash amicale
-  const showToast = (message: string) => {
+  // Notification flash amicale avec cleanup
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setNotificationMessage(message);
-    setTimeout(() => setNotificationMessage(''), 4000);
-  };
+    toastTimerRef.current = setTimeout(() => setNotificationMessage(''), 4000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   // Écoute en direct des événements WebSocket pour le Backoffice
   React.useEffect(() => {
@@ -222,13 +240,13 @@ export const BackofficeView: React.FC<Props> = ({
     setPinError('');
   };
 
-  // Calculs pour le tableau de bord
-  const totalRevenue = orders.reduce((sum, o) => sum + (o.paymentStatus === 'paid' ? o.total : 0), 0);
-  const ordersReceived = orders.filter(o => o.status === 'received').length;
-  const ordersPreparing = orders.filter(o => o.status === 'preparing').length;
-  const ordersReady = orders.filter(o => o.status === 'ready_or_out').length;
-  const ordersDelivered = orders.filter(o => o.status === 'delivered').length;
-  const wavePaymentsCount = orders.filter(o => o.paymentMethod === 'wave').length;
+  // Calculs pour le tableau de bord (memorisés)
+  const totalRevenue = useMemo(() => orders.reduce((sum, o) => sum + (o.paymentStatus === 'paid' ? o.total : 0), 0), [orders]);
+  const ordersReceived = useMemo(() => orders.filter(o => o.status === 'received').length, [orders]);
+  const ordersPreparing = useMemo(() => orders.filter(o => o.status === 'preparing').length, [orders]);
+  const ordersReady = useMemo(() => orders.filter(o => o.status === 'ready_or_out').length, [orders]);
+  const ordersDelivered = useMemo(() => orders.filter(o => o.status === 'delivered').length, [orders]);
+  const wavePaymentsCount = useMemo(() => orders.filter(o => o.paymentMethod === 'wave').length, [orders]);
 
   // Filtrage des commandes
   const filteredOrders = orderFilter === 'all' 
@@ -237,9 +255,13 @@ export const BackofficeView: React.FC<Props> = ({
 
   // Changement rapide d'état d'une commande
   const handleUpdateOrderStatus = async (orderId: string, newStatus: OrderStatus) => {
-    await mettreAJourStatutCommande(orderId, newStatus);
-    onRefreshData();
-    showToast(`Statut de la commande mis à jour vers "${newStatus}" !`);
+    try {
+      await mettreAJourStatutCommande(orderId, newStatus);
+      onRefreshData();
+      showToast(`Statut de la commande mis à jour vers "${newStatus}" !`);
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Erreur lors de la mise à jour du statut.');
+    }
   };
 
   // Validation manuelle du paiement (après vérification dans l'app Wave)
@@ -262,10 +284,14 @@ export const BackofficeView: React.FC<Props> = ({
 
   // Bascule rapide de disponibilité d'un produit (En stock / Rupture)
   const handleToggleProductAvailability = async (product: Product) => {
-    const updated = { ...product, isAvailable: !product.isAvailable };
-    await enregistrerProduit(updated);
-    onRefreshData();
-    showToast(`"${product.name}" est maintenant ${updated.isAvailable ? 'Disponible' : 'en Rupture de stock'}.`);
+    try {
+      const updated = { ...product, isAvailable: !product.isAvailable };
+      await enregistrerProduit(updated);
+      onRefreshData();
+      showToast(`"${product.name}" est maintenant ${updated.isAvailable ? 'Disponible' : 'en Rupture de stock'}.`);
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Erreur lors de la mise à jour.');
+    }
   };
 
   // Sauvegarde d'un produit nouveau ou modifié
@@ -296,26 +322,37 @@ export const BackofficeView: React.FC<Props> = ({
 
   // Suppression de produit
   const handleDeleteProduct = async (productId: string, productName: string) => {
-    if (confirm(`Confirmez-vous le retrait de "${productName}" de la vitrine ?`)) {
+    if (!confirm(`Confirmez-vous le retrait de "${productName}" de la vitrine ?`)) return;
+    try {
       await supprimerProduit(productId);
       onRefreshData();
-      showToast(`Produit retiré.`);
+      showToast(`Produit "${productName}" retiré.`);
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Erreur lors de la suppression.');
     }
   };
 
   // Sauvegarde des zones de livraison
   const handleSaveZones = async () => {
-    await enregistrerZonesLivraison(zonesForm);
-    onRefreshData();
-    showToast("Les tarifs de livraison pour Mbour et la Petite Côte ont été enregistrés !");
+    try {
+      await enregistrerZonesLivraison(zonesForm);
+      onRefreshData();
+      showToast("Les tarifs de livraison pour Mbour et la Petite Côte ont été enregistrés !");
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Erreur lors de la sauvegarde des zones.');
+    }
   };
 
   // Sauvegarde des paramètres de la boutique
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    await enregistrerParametres(settingsForm);
-    onRefreshData();
-    showToast("Paramètres de la pâtisserie mis à jour avec succès !");
+    try {
+      await enregistrerParametres(settingsForm);
+      onRefreshData();
+      showToast("Paramètres de la pâtisserie mis à jour avec succès !");
+    } catch (error: unknown) {
+      showToast(error instanceof Error ? error.message : 'Erreur lors de la sauvegarde.');
+    }
   };
 
   // Écran de verrouillage si non authentifié
@@ -414,6 +451,7 @@ export const BackofficeView: React.FC<Props> = ({
             onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
             className="lg:hidden p-2 rounded-xl bg-stone-800 text-stone-300 hover:text-white hover:bg-stone-700 cursor-pointer"
             aria-label="Basculer le menu vertical"
+            aria-expanded={isMobileMenuOpen}
           >
             {isMobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
           </button>
@@ -658,13 +696,14 @@ export const BackofficeView: React.FC<Props> = ({
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => {
-                    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(orders, null, 2));
-                    const downloadAnchor = document.createElement('a');
-                    downloadAnchor.setAttribute("href", dataStr);
-                    downloadAnchor.setAttribute("download", `commandes-minas-food-${new Date().toISOString().slice(0,10)}.json`);
-                    document.body.appendChild(downloadAnchor);
-                    downloadAnchor.click();
-                    downloadAnchor.remove();
+                    const dataStr = JSON.stringify(orders, null, 2);
+                    const blob = new Blob([dataStr], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `commandes-minas-food-${new Date().toISOString().slice(0,10)}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
                     showToast("Export comptable téléchargé avec succès !");
                   }}
                   className="px-3.5 py-2 rounded-xl bg-white border border-stone-300 text-stone-700 hover:bg-stone-50 text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
@@ -1056,7 +1095,7 @@ export const BackofficeView: React.FC<Props> = ({
                     category: 'gateaux',
                     description: '',
                     price: 8000,
-                    image: 'https://images.unsplash.com/photo-1578985545062-69928b1d9587?auto=format&fit=crop&w=900&q=80',
+                    image: DEFAULT_PRODUCT_IMAGE,
                     isAvailable: true,
                     isCustomizable: false,
                     preparationTime: 'Disponible en boutique'

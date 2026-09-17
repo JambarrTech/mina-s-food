@@ -11,7 +11,7 @@
  * - Espace Backoffice d'administration pour Mina et son équipe en laboratoire.
  */
 
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Product, 
   Order, 
@@ -25,6 +25,7 @@ import {
   chargerProduits, 
   chargerZonesLivraison, 
   chargerParametres, 
+  chargerCommandes,
   creerCommande,
   verifierPaiementWave
 } from './services/bakeryService.ts';
@@ -51,7 +52,7 @@ import {
   Heart
 } from 'lucide-react';
 
-const CATEGORIES: { id: 'all' | ProductCategory; label: string; icon: any; count?: number }[] = [
+const CATEGORIES: { id: 'all' | ProductCategory; label: string; icon: React.ComponentType<{className?: string}>; count?: number }[] = [
   { id: 'all', label: 'Toutes les créations', icon: Sparkles },
   { id: 'gateaux', label: 'Gâteaux d’Événements', icon: Cake },
   { id: 'viennoiseries', label: 'Viennoiseries Pur Beurre', icon: Croissant },
@@ -76,7 +77,14 @@ export default function App() {
   const minuteurNouvelleTentative = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Le backoffice est accessible uniquement par l'URL dédiée /admin.
-  const isAdminRoute = window.location.pathname === '/admin' || window.location.pathname.startsWith('/admin/');
+  // Réactif aux changements de navigation (popstate).
+  const [pathname, setPathname] = useState<string>(window.location.pathname);
+  useEffect(() => {
+    const onPopState = () => setPathname(window.location.pathname);
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+  const isAdminRoute = pathname === '/admin' || pathname.startsWith('/admin/');
 
   // Filtres catalogue
   const [selectedCategory, setSelectedCategory] = useState<'all' | ProductCategory>('all');
@@ -96,13 +104,34 @@ export default function App() {
   const [isCartOpen, setIsCartOpen] = useState<boolean>(false);
   const [selectedCakeForCustomization, setSelectedCakeForCustomization] = useState<Product | null>(null);
   const [isWaveCheckoutOpen, setIsWaveCheckoutOpen] = useState<boolean>(false);
-  const [pendingCheckoutData, setPendingCheckoutData] = useState<any>(null);
+  const [pendingCheckoutData, setPendingCheckoutData] = useState<{
+    customerName: string;
+    customerPhone: string;
+    customerAddress?: string;
+    deliveryZone: string;
+    deliveryType: 'livraison_mbour' | 'retrait_boutique';
+    deliveryFee: number;
+    subtotal: number;
+    total: number;
+    items: any[];
+    customerNotes?: string;
+    requestedDate: string;
+    requestedTime: string;
+  } | null>(null);
   const [isTrackingOpen, setIsTrackingOpen] = useState<boolean>(false);
   const [trackingOrderCode, setTrackingOrderCode] = useState<string>('');
   const [selectedInvoiceOrder, setSelectedInvoiceOrder] = useState<Order | null>(null);
   const [toastMessage, setToastMessage] = useState<string>('');
 
-  // Synchronisation du panier vers le stockage local
+  // Nettoyage des timers au démontage
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      if (minuteurNouvelleTentative.current) clearTimeout(minuteurNouvelleTentative.current);
+    };
+  }, []);
+
+  // Synchronisation du panier vers le stockage local (debounced)
   useEffect(() => {
     localStorage.setItem('minas_food_cart_v1', JSON.stringify(cart));
   }, [cart]);
@@ -118,7 +147,7 @@ export default function App() {
     try {
       const [prods, ords, zones, params] = await Promise.all([
         chargerProduits(),
-        Promise.resolve([]),
+        chargerCommandes(),
         chargerZonesLivraison(),
         chargerParametres()
       ]);
@@ -149,36 +178,39 @@ export default function App() {
     rafraichirDonnees();
   }, []);
 
-  const afficherToast = (msg: string) => {
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const afficherToast = useCallback((msg: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(''), 3000);
-  };
+    toastTimerRef.current = setTimeout(() => setToastMessage(''), 3000);
+  }, []);
 
   // Calculs du panier
   const cartCount = useMemo(() => cart.reduce((total, item) => total + item.quantity, 0), [cart]);
   const cartTotal = useMemo(() => cart.reduce((total, item) => total + (item.unitPrice * item.quantity), 0), [cart]);
 
   // Ajout direct d'un produit standard au panier
-  const handleAddToCart = (product: Product) => {
-    const existingIndex = cart.findIndex(item => item.product.id === product.id && !item.customization);
-    if (existingIndex >= 0) {
-      const newCart = [...cart];
-      newCart[existingIndex].quantity += 1;
-      setCart(newCart);
-    } else {
-      const newItem: CartItem = {
-        cartItemId: `cart-${Date.now()}-${Math.random()}`,
-        product,
-        quantity: 1,
-        unitPrice: product.price
-      };
-      setCart([...cart, newItem]);
-    }
+  const handleAddToCart = useCallback((product: Product) => {
+    setCart(prevCart => {
+      const existingIndex = prevCart.findIndex(item => item.product.id === product.id && !item.customization);
+      if (existingIndex >= 0) {
+        return prevCart.map((item, i) => i === existingIndex ? { ...item, quantity: item.quantity + 1 } : item);
+      } else {
+        const newItem: CartItem = {
+          cartItemId: `cart-${Date.now()}-${Math.random()}`,
+          product,
+          quantity: 1,
+          unitPrice: product.price
+        };
+        return [...prevCart, newItem];
+      }
+    });
     afficherToast(`"${product.name}" ajouté au panier !`);
-  };
+  }, []);
 
   // Ajout d'un gâteau personnalisé
-  const handleAddCustomizedCake = (customization: CakeCustomizationOptions, calculatedPrice: number) => {
+  const handleAddCustomizedCake = useCallback((customization: CakeCustomizationOptions, calculatedPrice: number) => {
     if (!selectedCakeForCustomization) return;
     const newItem: CartItem = {
       cartItemId: `cart-cake-${Date.now()}`,
@@ -187,45 +219,63 @@ export default function App() {
       unitPrice: calculatedPrice,
       customization
     };
-    setCart([...cart, newItem]);
+    setCart(prevCart => [...prevCart, newItem]);
     afficherToast(`Gâteau sur-mesure ajouté avec succès !`);
     setIsCartOpen(true);
-  };
+  }, [selectedCakeForCustomization]);
 
   // Modification quantité dans le panier
-  const handleUpdateCartQuantity = (cartItemId: string, newQty: number) => {
+  const handleUpdateCartQuantity = useCallback((cartItemId: string, newQty: number) => {
     if (newQty <= 0) {
-      handleRemoveCartItem(cartItemId);
+      setCart(prevCart => prevCart.filter(item => item.cartItemId !== cartItemId));
     } else {
-      setCart(cart.map(item => item.cartItemId === cartItemId ? { ...item, quantity: newQty } : item));
+      setCart(prevCart => prevCart.map(item => item.cartItemId === cartItemId ? { ...item, quantity: newQty } : item));
     }
-  };
+  }, []);
 
   // Suppression d'un article du panier
-  const handleRemoveCartItem = (cartItemId: string) => {
-    setCart(cart.filter(item => item.cartItemId !== cartItemId));
-  };
+  const handleRemoveCartItem = useCallback((cartItemId: string) => {
+    setCart(prevCart => prevCart.filter(item => item.cartItemId !== cartItemId));
+  }, []);
 
   // Passage vers le checkout Wave
-  const handleProceedToWave = (checkoutData: any) => {
+  const handleProceedToWave = useCallback((checkoutData: {
+    customerName: string;
+    customerPhone: string;
+    customerAddress?: string;
+    deliveryZone: string;
+    deliveryType: 'livraison_mbour' | 'retrait_boutique';
+    deliveryFee: number;
+    subtotal: number;
+    total: number;
+    items: any[];
+    customerNotes?: string;
+    requestedDate: string;
+    requestedTime: string;
+  }) => {
     setPendingCheckoutData(checkoutData);
     setIsCartOpen(false);
     setIsWaveCheckoutOpen(true);
-  };
+  }, []);
 
   // Enregistrement effectif de la commande après validation Wave
   const handleOrderConfirmed = async (confirmedOrder: Order) => {
-    const savedOrder = await creerCommande(confirmedOrder);
-    if (confirmedOrder.paymentMethod === 'wave' && confirmedOrder.waveTransactionRef) {
-      await verifierPaiementWave({
-        orderId: savedOrder.id,
-        transactionRef: confirmedOrder.waveTransactionRef,
-        amount: savedOrder.total
-      });
+    try {
+      const savedOrder = await creerCommande(confirmedOrder);
+      if (confirmedOrder.paymentMethod === 'wave' && confirmedOrder.waveTransactionRef) {
+        await verifierPaiementWave({
+          orderId: savedOrder.id,
+          transactionRef: confirmedOrder.waveTransactionRef,
+          amount: savedOrder.total
+        });
+      }
+      setCart([]);
+      await rafraichirDonnees();
+      setTrackingOrderCode(confirmedOrder.orderNumber);
+    } catch (err) {
+      console.error('Erreur lors de la confirmation de la commande:', err);
+      afficherToast('Erreur lors de l\'enregistrement. Veuillez réessayer.');
     }
-    setCart([]); // Vider le panier
-    await rafraichirDonnees();
-    setTrackingOrderCode(confirmedOrder.orderNumber);
   };
 
   // Filtrage des produits selon la catégorie et la recherche
@@ -300,7 +350,7 @@ export default function App() {
       
       {/* Toast d'alerte amicale */}
       {toastMessage && (
-        <div className="fixed bottom-20 sm:bottom-6 right-6 z-50 px-4 py-3 rounded-2xl bg-stone-900 text-amber-200 text-xs font-semibold shadow-2xl border border-amber-500/40 animate-slideDown flex items-center gap-2">
+        <div className="fixed bottom-28 sm:bottom-6 right-6 z-50 px-4 py-3 rounded-2xl bg-stone-900 text-amber-200 text-xs font-semibold shadow-2xl border border-amber-500/40 animate-slideDown flex items-center gap-2">
           <Check className="w-4 h-4 text-emerald-400" />
           <span>{toastMessage}</span>
         </div>
