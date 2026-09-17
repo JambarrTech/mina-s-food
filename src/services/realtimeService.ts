@@ -60,6 +60,12 @@ class RealtimeService {
   private pushPermissionState: NotificationPermission | 'unsupported' = 'default';
   private pushSubscriptionState: 'unknown' | 'subscribed' | 'not-subscribed' = 'unknown';
   private subscriptionListeners: Set<(state: 'unknown' | 'subscribed' | 'not-subscribed') => void> = new Set();
+  // Identifiants d'événements déjà vus : une reconnexion SSE rejoue les derniers
+  // événements (serveur), sans ce déduplicateur chaque replay re-déclenche
+  // notification/son → boucle. Plafonné pour rester borné en mémoire.
+  private seenEventIds = new Map<string, number>();
+  private static readonly SEEN_EVENTS_MAX = 200;
+  private static readonly SEEN_EVENTS_TTL_MS = 10 * 60_000;
 
   constructor() {
     if (typeof window !== 'undefined' && 'Notification' in window) {
@@ -162,7 +168,11 @@ class RealtimeService {
       for (const eventName of namedEvents) {
         sse.addEventListener(eventName, (raw: Event) => {
           try {
-            const payload: RealtimeEventData = JSON.parse((raw as MessageEvent).data);
+            const payload = JSON.parse((raw as MessageEvent).data) as RealtimeEventData & { id?: string };
+            // Identité de l'événement (ligne "id:" du flux SSE) : indispensable
+            // pour ignorer les replays à chaque reconnexion (boucle notifications).
+            const lastEventId = (raw as MessageEvent).lastEventId;
+            if (lastEventId && !payload.id) payload.id = lastEventId;
             this.handleIncomingEvent(payload);
           } catch (err) {
             console.error('[SSE] Erreur décodage message :', err);
@@ -199,8 +209,27 @@ class RealtimeService {
   /**
    * Traitement des événements reçus du serveur
    */
-  private handleIncomingEvent(payload: RealtimeEventData): void {
+  private handleIncomingEvent(payload: RealtimeEventData & { id?: string }): void {
     const { event, data, timestamp } = payload;
+
+    // Déduplication des replays (reconnexion SSE après ~50 s sur Vercel, ou
+    // double abonnement). Un même identifiant d'événement n'est traité qu'une
+    // fois : c'est ce qui supprimait la boucle de notifications.
+    const eventId = payload.id;
+    if (eventId) {
+      const now = Date.now();
+      if (this.seenEventIds.has(eventId)) return;
+      this.seenEventIds.set(eventId, now);
+      if (this.seenEventIds.size > RealtimeService.SEEN_EVENTS_MAX) {
+        const toEvict = [...this.seenEventIds.entries()]
+          .filter(([, t]) => now - t > RealtimeService.SEEN_EVENTS_TTL_MS)
+          .map(([k]) => k);
+        for (const key of toEvict) this.seenEventIds.delete(key);
+        const remaining = [...this.seenEventIds.entries()].sort((a, b) => a[1] - b[1]);
+        const overflow = this.seenEventIds.size - RealtimeService.SEEN_EVENTS_MAX;
+        for (let i = 0; i < overflow; i++) this.seenEventIds.delete(remaining[i][0]);
+      }
+    }
 
     if (event === 'order:created') {
       soundManager.playOrderChime();

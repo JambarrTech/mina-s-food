@@ -54,8 +54,10 @@ function enqueueRealtimeEvent(event: string, payload: unknown, timestamp: string
 // + notifications natives (push) même quand l'onglet est fermé.
 function broadcastRealtimeEvent(event: string, payload: any, push?: { title: string; message: string; type?: string; orderNumber?: string; url?: string }) {
   const timestamp = new Date().toISOString();
-  const message = JSON.stringify({ event, data: payload, timestamp });
   const id = enqueueRealtimeEvent(event, payload, timestamp);
+  // L'identifiant est injecté dans le payload pour permettre au client de
+  // dédupliquer (les replays SSE à la reconnexion ne doivent pas re-notifier).
+  const message = JSON.stringify({ id, event, data: payload, timestamp });
   persistRealtimeEventDb(id, event, payload, timestamp);
 
   if (wss) {
