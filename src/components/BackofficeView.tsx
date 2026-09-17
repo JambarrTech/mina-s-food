@@ -28,6 +28,9 @@ import {
   enregistrerZonesLivraison, 
   enregistrerParametres,
   authentifierAdmin,
+  verifierSessionAdmin,
+  deconnecterAdmin,
+  validerPaiementCommande,
   getAdminAuthHeaders
 } from '../services/bakeryService.ts';
 import { 
@@ -60,13 +63,7 @@ import { InvoiceModal } from './InvoiceModal.tsx';
 import { WaveLogo } from './WaveLogo.tsx';
 import { BakeryLogo } from './BakeryLogo.tsx';
 import { realtimeService } from '../services/realtimeService.ts';
-import {
-  checkBruteForceLockout,
-  isValidAdminPin,
-  recordFailedLoginAttempt,
-  resetFailedLoginAttempts,
-  sanitizeInput
-} from '../utils/securityUtils.ts';
+import { sanitizeInput } from '../utils/securityUtils.ts';
 
 interface Props {
   orders: Order[];
@@ -85,11 +82,11 @@ export const BackofficeView: React.FC<Props> = ({
   onClose,
   onRefreshData
 }) => {
-  // Sécurisation d'accès par code PIN configurable et verrouillage anti-bruteforce
+  // Sécurisation d'accès par code PIN : l'authentification, le verrouillage
+  // anti-bruteforce et la session sont entièrement gérés par l'API serveur.
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [pinCode, setPinCode] = useState<string>('');
   const [pinError, setPinError] = useState<string>('');
-  const [lockoutStatus, setLockoutStatus] = useState(checkBruteForceLockout());
 
   // Navigation dans les onglets du Backoffice
   const [activeTab, setActiveTab] = useState<'dashboard' | 'orders' | 'catalog' | 'zones' | 'settings'>('dashboard');
@@ -143,9 +140,15 @@ export const BackofficeView: React.FC<Props> = ({
       onRefreshData();
     });
 
+    const unsubDeclared = realtimeService.on('payment:declared', (data: any) => {
+      showToast(`Paiement Wave déclaré par le client pour #${data.orderNumber || ''} : à vérifier dans l'app Wave.`);
+      onRefreshData();
+    });
+
     return () => {
       unsubOrder();
       unsubPayment();
+      unsubDeclared();
     };
   }, [isAuthenticated, onRefreshData]);
 
@@ -180,41 +183,43 @@ export const BackofficeView: React.FC<Props> = ({
     }
   };
 
-  // Authentification par PIN
+  // Restauration de session : un jeton valide évite de redemander le PIN.
+  React.useEffect(() => {
+    let active = true;
+    verifierSessionAdmin().then(valid => {
+      if (active && valid) {
+        setIsAuthenticated(true);
+        onRefreshData();
+      }
+    });
+    return () => { active = false; };
+  }, [onRefreshData]);
+
+  // Authentification par PIN (validée exclusivement par le serveur)
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const sanitizedPin = sanitizeInput(pinCode, 32);
-    const lockout = checkBruteForceLockout();
-
-    if (lockout.isLocked) {
-      setPinError(`Accès temporairement bloqué. Réessayez dans ${lockout.remainingSeconds} s.`);
+    if (!sanitizedPin) {
+      setPinError('Veuillez saisir votre code d’accès.');
       return;
     }
 
-    if (isValidAdminPin(sanitizedPin)) {
-      try {
-        await authentifierAdmin(sanitizedPin);
-        setIsAuthenticated(true);
-        setPinError('');
-        setPinCode('');
-        resetFailedLoginAttempts();
-        setLockoutStatus(checkBruteForceLockout());
-        onRefreshData();
-      } catch (error: any) {
-        setPinError(error?.message || 'Connexion administrateur impossible.');
-      }
-      return;
+    try {
+      await authentifierAdmin(sanitizedPin);
+      setIsAuthenticated(true);
+      setPinError('');
+      setPinCode('');
+      onRefreshData();
+    } catch (error: any) {
+      setPinError(error?.message || 'Connexion administrateur impossible.');
     }
+  };
 
-    const nextLockout = recordFailedLoginAttempt();
-    setLockoutStatus(nextLockout);
-
-    if (nextLockout.isLocked) {
-      setPinError('Trop de tentatives. Le backoffice est temporairement verrouillé pendant 60 secondes.');
-      return;
-    }
-
-    setPinError(`Code d’accès incorrect. Il vous reste ${nextLockout.attemptsLeft} tentative(s).`);
+  const handleLogout = () => {
+    deconnecterAdmin();
+    setIsAuthenticated(false);
+    setPinCode('');
+    setPinError('');
   };
 
   // Calculs pour le tableau de bord
@@ -235,6 +240,24 @@ export const BackofficeView: React.FC<Props> = ({
     await mettreAJourStatutCommande(orderId, newStatus);
     onRefreshData();
     showToast(`Statut de la commande mis à jour vers "${newStatus}" !`);
+  };
+
+  // Validation manuelle du paiement (après vérification dans l'app Wave)
+  const handleValidatePayment = async (
+    order: Order,
+    paymentStatus: 'paid' | 'failed' | 'refunded'
+  ) => {
+    try {
+      await validerPaiementCommande(order.id, paymentStatus, order.waveTransactionRef);
+      onRefreshData();
+      showToast(
+        paymentStatus === 'paid'
+          ? `Paiement de ${order.orderNumber} confirmé !`
+          : `Paiement de ${order.orderNumber} marqué « ${paymentStatus} ».`
+      );
+    } catch (error: any) {
+      showToast(error?.message || 'Impossible de mettre à jour le paiement.');
+    }
   };
 
   // Bascule rapide de disponibilité d'un produit (En stock / Rupture)
@@ -321,22 +344,20 @@ export const BackofficeView: React.FC<Props> = ({
                 placeholder="Entrez le code d'accès"
                 className="w-full px-4 py-3 rounded-xl bg-stone-900 border border-stone-600 text-center font-mono text-sm tracking-widest text-white focus:outline-none focus:ring-2 focus:ring-amber-500"
                 autoFocus
-                disabled={lockoutStatus.isLocked}
               />
               {pinError && <p className="text-xs text-red-400 mt-1">{pinError}</p>}
             </div>
 
             <button
               type="submit"
-              disabled={lockoutStatus.isLocked}
               className="w-full py-3 px-4 rounded-xl bg-amber-700 hover:bg-amber-600 text-white font-semibold text-sm transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              {lockoutStatus.isLocked ? 'Backoffice verrouillé' : 'Déverrouiller le Backoffice'}
+              Déverrouiller le Backoffice
             </button>
           </form>
 
           <div className="pt-4 border-t border-stone-700 flex justify-between items-center text-xs text-stone-400">
-            <span>PIN défini par l’environnement</span>
+            <span>Accès protégé côté serveur</span>
             <button
               onClick={onClose}
               className="text-amber-400 hover:underline cursor-pointer"
@@ -563,6 +584,16 @@ export const BackofficeView: React.FC<Props> = ({
             >
               <ArrowLeft className="w-4 h-4" />
               <span>Voir la boutique client</span>
+            </button>
+
+            {/* Verrouillage de la session admin */}
+            <button
+              onClick={handleLogout}
+              className="w-full py-2.5 px-3 rounded-xl bg-red-900/40 hover:bg-red-800/60 text-red-200 hover:text-white text-xs font-semibold flex items-center justify-center gap-2 border border-red-800/50 transition-colors cursor-pointer"
+              title="Verrouiller la session"
+            >
+              <X className="w-4 h-4" />
+              <span>Verrouiller la session</span>
             </button>
           </div>
         </div>
@@ -875,13 +906,22 @@ export const BackofficeView: React.FC<Props> = ({
                       <div className="space-y-2 bg-amber-50/40 p-3 rounded-xl border border-amber-100">
                         <div className="font-semibold text-stone-800 flex items-center justify-between">
                           <span>Détails livraison / contact :</span>
-                          <span className="text-[11px] font-bold text-amber-800 inline-flex items-center gap-1">
+                          <span className={`text-[11px] font-bold inline-flex items-center gap-1 ${
+                            order.paymentStatus === 'paid' ? 'text-emerald-700'
+                              : order.paymentStatus === 'failed' ? 'text-red-700'
+                              : 'text-amber-800'
+                          }`}>
                             {order.paymentMethod === 'wave' ? (
                               <>
                                 <WaveLogo size="xs" />
-                                <span>Wave Payé</span>
+                                <span>
+                                  {order.paymentStatus === 'paid' ? 'Wave Payé'
+                                    : order.paymentStatus === 'failed' ? 'Wave échoué'
+                                    : order.paymentStatus === 'refunded' ? 'Wave remboursé'
+                                    : 'Wave en attente'}
+                                </span>
                               </>
-                            ) : '💵 Espèces livreur'}
+                            ) : (order.paymentStatus === 'paid' ? '💵 Espèces payées' : '💵 Espèces livreur')}
                           </span>
                         </div>
                         <div className="text-stone-700 space-y-1">
@@ -933,6 +973,25 @@ export const BackofficeView: React.FC<Props> = ({
                         >
                           <FileText className="w-3.5 h-3.5 text-amber-700" /> Facture Client
                         </button>
+
+                        {order.paymentMethod === 'wave' && order.paymentStatus !== 'paid' && (
+                          <>
+                            <button
+                              onClick={() => handleValidatePayment(order, 'paid')}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer shadow-2xs"
+                              title="Confirmer la réception du paiement Wave (vérifié dans l'app Wave)"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Valider le paiement
+                            </button>
+                            <button
+                              onClick={() => handleValidatePayment(order, 'failed')}
+                              className="px-2.5 py-1.5 rounded-lg border border-red-300 text-red-700 hover:bg-red-50 text-xs font-semibold cursor-pointer"
+                              title="Marquer le paiement comme échoué"
+                            >
+                              Échec
+                            </button>
+                          </>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-1.5">

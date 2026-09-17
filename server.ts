@@ -141,6 +141,31 @@ app.use(express.json({
 }));
 
 // ============================================================================
+// CORS explicite : l'application est servie sur la même origine, on n'autorise
+// donc que les origines déclarées (ALLOWED_ORIGINS, séparées par des virgules).
+// Les appels serveur-à-serveur (webhook Wave) n'ont pas d'origine et passent.
+// ============================================================================
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+app.use((req: Request, res: Response, next: () => void) => {
+  const origin = req.header('origin');
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Wave-Signature');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  return next();
+});
+
+// ============================================================================
 // Base de données Neon (PostgreSQL serverless)
 // ============================================================================
 const pool = process.env.DATABASE_URL
@@ -152,7 +177,53 @@ const pool = process.env.DATABASE_URL
       idleTimeoutMillis: 30000
     })
   : null;
+
+// Le réseau (DNS, bascule de région Neon, cold start serverless) peut produire
+// des pannes transitoires (getaddrinfo EAI_AGAIN, ENOTFOUND, ETIMEDOUT, ...).
+// On relance automatiquement ces échecs AVANT tout échange avec la base
+// (donc sans risque de double écriture), avec un backoff court. La requête
+// n'échoue qu'après plusieurs tentatives, au lieu du premier aléa réseau.
+const DB_RETRYABLE_ERROR = /EAI_AGAIN|ENOTFOUND|ENETUNREACH|EHOSTUNREACH|ECONNREFUSED|Connection refused|ETIMEDOUT|timeout exceeded|connection timeout/i;
+const DB_RETRY_DELAYS_MS = [250, 600];
+if (pool) {
+  const rawDbQuery = pool.query.bind(pool);
+  const retryingQuery = (async (...args: any[]) => {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt <= DB_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        return await rawDbQuery(...args);
+      } catch (err: any) {
+        lastErr = err;
+        if (attempt >= DB_RETRY_DELAYS_MS.length || !DB_RETRYABLE_ERROR.test(String(err?.message || err))) break;
+        console.warn(`[DB] Erreur transitoire (${err?.message}), relance ${attempt + 1}/${DB_RETRY_DELAYS_MS.length}...`);
+        await new Promise(r => setTimeout(r, DB_RETRY_DELAYS_MS[attempt]));
+      }
+    }
+    throw lastErr;
+  }) as typeof pool.query;
+  pool.query = retryingQuery;
+  // Un client inactif en erreur ne doit pas faire planter le processus.
+  pool.on('error', (err: any) => {
+    console.warn('[DB] Erreur de pool inactif :', err?.message || err);
+  });
+}
 const adminPin = (process.env.ADMIN_PIN || process.env.VITE_ADMIN_PIN || 'mina2026').trim();
+
+// Informations légales de la boutique. Déclarées tôt car utilisées par le
+// seed de démonstration et la génération de factures (évite toute référence
+// en zone morte temporelle lors de l'initialisation de la base).
+const SELLER_INFO = {
+  name: "Mme Aminata 'Mina' Faye",
+  brand: "Mina's Food - Saveurs faites avec amour",
+  city: "Mbour",
+  address: "Quartier Grand Mbour, Face Stade Caroline Faye, Route de Saly",
+  country: "Sénégal",
+  ninea: "009842145 2V3",
+  rccm: "SN.MBR.2023.A.1420",
+  phoneWave: "+221 77 407 81 20",
+  phoneWhatsApp: "+221 77 407 81 20",
+  email: "commandes@minasfood-mbour.sn"
+};
 
 // ============================================================================
 // Sessions administrateur.
@@ -424,6 +495,43 @@ loadDbPushSubscriptions();
 interface RateWindow { count: number; resetAt: number }
 const rateBuckets = new Map<string, RateWindow>();
 
+// Consomme une unité de quota pour une clé et renvoie l'état courant.
+// En serverless (Neon disponible), le compteur est persistant et partagé entre
+// instances via un UPSERT atomique ; sinon on retombe sur la mémoire locale.
+async function consumeRateLimit(
+  key: string,
+  windowMs: number,
+  max: number
+): Promise<{ allowed: boolean; count: number; resetAt: number }> {
+  const now = Date.now();
+  if (pool) {
+    try {
+      const resetAt = now + windowMs;
+      const { rows } = await pool.query(
+        `INSERT INTO rate_limits (key, count, reset_at) VALUES ($1, 1, $2)
+         ON CONFLICT (key) DO UPDATE SET
+           count = CASE WHEN rate_limits.reset_at <= $3 THEN 1 ELSE rate_limits.count + 1 END,
+           reset_at = CASE WHEN rate_limits.reset_at <= $3 THEN $2 ELSE rate_limits.reset_at END
+         RETURNING count, reset_at`,
+        [key, resetAt, now]
+      );
+      const count = Number(rows[0].count);
+      const storedResetAt = Number(rows[0].reset_at);
+      return { allowed: count <= max, count, resetAt: storedResetAt };
+    } catch {
+      // Table absente ou base indisponible : repli mémoire.
+    }
+  }
+
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return { allowed: max >= 1, count: 1, resetAt: now + windowMs };
+  }
+  bucket.count += 1;
+  return { allowed: bucket.count <= max, count: bucket.count, resetAt: bucket.resetAt };
+}
+
 async function rateLimit(
   req: Request,
   res: Response,
@@ -431,16 +539,9 @@ async function rateLimit(
   { windowMs = 60_000, max = 60 }: { windowMs?: number; max?: number } = {}
 ) {
   const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-  const now = Date.now();
-  const bucket = rateBuckets.get(ip);
+  const { allowed } = await consumeRateLimit(`rl:${max}:${windowMs}:${ip}`, windowMs, max);
 
-  if (!bucket || bucket.resetAt <= now) {
-    rateBuckets.set(ip, { count: 1, resetAt: now + windowMs });
-    return next();
-  }
-
-  bucket.count += 1;
-  if (bucket.count > max) {
+  if (!allowed) {
     return res.status(429).json({
       success: false,
       error: 'Trop de requêtes. Veuillez patienter quelques instants avant de réessayer.'
@@ -472,7 +573,53 @@ setInterval(() => {
   for (const [key, bucket] of rateBuckets) {
     if (bucket.resetAt <= now) rateBuckets.delete(key);
   }
+  if (pool) {
+    pool.query('DELETE FROM rate_limits WHERE reset_at <= $1', [now]).catch(() => {});
+  }
 }, 60_000).unref?.();
+
+// ============================================================================
+// Verrouillage anti-bruteforce du backoffice, côté serveur et par adresse IP
+// (la protection cliente n'est qu'un confort : elle est contournable).
+// ============================================================================
+const ADMIN_MAX_ATTEMPTS = 5;
+const ADMIN_LOCKOUT_MS = 60_000;
+const adminFailures = new Map<string, { attempts: number; lockedUntil: number }>();
+
+function clientIp(req: Request): string {
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function getAdminLockout(req: Request) {
+  const now = Date.now();
+  const entry = adminFailures.get(clientIp(req));
+  if (entry && entry.lockedUntil > now) {
+    return { isLocked: true, remainingSeconds: Math.ceil((entry.lockedUntil - now) / 1000), attemptsLeft: 0 };
+  }
+  // Fin de verrouillage : on repart d'un compteur vierge.
+  if (entry && entry.lockedUntil > 0 && entry.lockedUntil <= now) {
+    adminFailures.delete(clientIp(req));
+    return { isLocked: false, remainingSeconds: 0, attemptsLeft: ADMIN_MAX_ATTEMPTS };
+  }
+  return { isLocked: false, remainingSeconds: 0, attemptsLeft: ADMIN_MAX_ATTEMPTS - (entry?.attempts || 0) };
+}
+
+function recordAdminFailure(req: Request) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  const entry = adminFailures.get(ip);
+  const attempts = (entry?.attempts || 0) + 1;
+  if (attempts >= ADMIN_MAX_ATTEMPTS) {
+    adminFailures.set(ip, { attempts, lockedUntil: now + ADMIN_LOCKOUT_MS });
+    return { isLocked: true, remainingSeconds: 60, attemptsLeft: 0 };
+  }
+  adminFailures.set(ip, { attempts, lockedUntil: 0 });
+  return { isLocked: false, remainingSeconds: 0, attemptsLeft: ADMIN_MAX_ATTEMPTS - attempts };
+}
+
+function resetAdminFailures(req: Request) {
+  adminFailures.delete(clientIp(req));
+}
 
 function pinsMatch(candidate: string) {
   const expected = Buffer.from(adminPin);
@@ -551,29 +698,73 @@ const demoOrders: any[] = [];
 // ============================================================================
 // Auto-init de la base (base Neon neuve : tables serverless + seed catalogue)
 // ============================================================================
-let dbStateInitialized = false;
+// Initialisation unique et partagée : les appels concurrents (serverless froid)
+// attendent la même promesse au lieu de relancer le seed plusieurs fois.
+let dbStateInitPromise: Promise<void> | null = null;
 
-async function ensureDatabaseState() {
-  if (!pool || dbStateInitialized) return;
-  try {
-    dbStateInitialized = true;
-    await ensureAdminSessionsTable();
-    await pool.query(`CREATE TABLE IF NOT EXISTS realtime_events (
-      id text PRIMARY KEY,
-      event text NOT NULL,
-      payload jsonb NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now()
-    )`);
-    await pool.query('CREATE INDEX IF NOT EXISTS idx_realtime_events_created ON realtime_events (created_at DESC)');
-    await pool.query(
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_wave_ref_unique
-       ON orders (wave_transaction_ref) WHERE wave_transaction_ref IS NOT NULL`
-    );
-    await seedDemoDataIfEmpty();
-  } catch (err: any) {
-    dbStateInitialized = false; // nouvelle tentative au prochain appel
-    console.warn("[Mina's Food] Initialisation de la base impossible :", err.message);
+async function ensureDatabaseState(): Promise<void> {
+  if (!pool) return;
+  if (!dbStateInitPromise) {
+    dbStateInitPromise = (async () => {
+      await ensureAdminSessionsTable();
+      await pool.query(`CREATE TABLE IF NOT EXISTS realtime_events (
+        id text PRIMARY KEY,
+        event text NOT NULL,
+        payload jsonb NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )`);
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_realtime_events_created ON realtime_events (created_at DESC)');
+      await pool.query(`CREATE TABLE IF NOT EXISTS customers (
+        id text PRIMARY KEY,
+        name text NOT NULL,
+        phone text NOT NULL UNIQUE,
+        email text,
+        favorite_zone text,
+        favorite_address text,
+        loyalty_points integer NOT NULL DEFAULT 0,
+        role text NOT NULL DEFAULT 'client',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS invoices (
+        id text PRIMARY KEY,
+        invoice_number text NOT NULL UNIQUE,
+        order_id text REFERENCES orders (id) ON DELETE CASCADE,
+        seller_info jsonb NOT NULL,
+        client_info jsonb NOT NULL,
+        subtotal integer NOT NULL DEFAULT 0,
+        delivery_fee integer NOT NULL DEFAULT 0,
+        tax_amount integer NOT NULL DEFAULT 0,
+        total integer NOT NULL,
+        payment_method text NOT NULL,
+        payment_status text NOT NULL DEFAULT 'pending',
+        wave_transaction_ref text,
+        verification_code text,
+        notes text,
+        issued_at timestamptz NOT NULL DEFAULT now(),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS rate_limits (
+        key text PRIMARY KEY,
+        count integer NOT NULL DEFAULT 0,
+        reset_at bigint NOT NULL
+      )`);
+      await pool.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_wave_ref_unique
+         ON orders (wave_transaction_ref) WHERE wave_transaction_ref IS NOT NULL`
+      );
+      // Migration idempotente : certaines bases proviennent de schema.sql avec
+      // un trigger trg_invoices_updated_at mais sans la colonne correspondante.
+      await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()`);
+      await seedDemoDataIfEmpty();
+    })().catch((err: any) => {
+      dbStateInitPromise = null; // nouvelle tentative au prochain appel
+      console.warn("[Mina's Food] Initialisation de la base impossible :", err.message);
+      throw err;
+    });
   }
+  return dbStateInitPromise;
 }
 
 async function seedDemoDataIfEmpty() {
@@ -622,7 +813,7 @@ async function listRecentEventsDb(): Promise<Array<{ id: string; event: string; 
   }
 }
 
-ensureDatabaseState();
+ensureDatabaseState().catch(() => {});
 
 function getDemoProduct(productId: string) {
   return demoProducts.find(product => product.id === productId);
@@ -657,8 +848,19 @@ async function validateOrderPayload(orderData: any) {
   }));
 
   const subtotal = items.reduce((total: number, item: any) => total + item.unitPrice * item.quantity, 0);
-  const deliveryFee = Number(orderData.deliveryFee) || 0;
-  if (!Number.isInteger(deliveryFee) || deliveryFee < 0) throw new Error('Frais de livraison invalides.');
+
+  // Les frais de livraison sont recalculés côté serveur à partir de la zone
+  // active : le client ne peut pas les fixer ni les mettre à zéro.
+  let deliveryFee = 0;
+  if (orderData.deliveryType === 'livraison_mbour') {
+    const zone = await findActiveZoneByName(orderData.deliveryZone);
+    if (!zone) throw new Error('Zone de livraison inconnue ou inactive.');
+    deliveryFee = Number(zone.fee) || 0;
+  } else {
+    // Retrait en boutique : aucun frais, uniquement des articles.
+    deliveryFee = 0;
+  }
+
   const total = subtotal + deliveryFee;
   return { ...orderData, items, subtotal, deliveryFee, total };
 }
@@ -812,6 +1014,18 @@ async function listZones() {
   }
   const { rows } = await pool.query('SELECT * FROM delivery_zones ORDER BY fee');
   return rows.map(mapZone);
+}
+
+// Retrouve une zone de livraison active par son nom (comparaison insensible à
+// la casse et aux espaces). Sert de source de vérité pour les frais côté serveur.
+async function findActiveZoneByName(name: unknown) {
+  const target = String(name || '').trim().toLocaleLowerCase('fr-FR');
+  if (!target) return null;
+  const zones = await listZones();
+  return zones.find(zone =>
+    zone.isActive !== false &&
+    String(zone.name || '').trim().toLocaleLowerCase('fr-FR') === target
+  ) || null;
 }
 
 async function replaceZones(zones: any[]) {
@@ -972,6 +1186,10 @@ async function createOrder(orderData: any) {
   }
 
   const saved = await getOrderByIdentifier(orderId);
+  if (saved) {
+    await upsertCustomerFromOrder(saved);
+    await saveInvoice(saved);
+  }
   return { order: saved, orderNumber, orderId: saved?.id };
 }
 
@@ -990,34 +1208,99 @@ async function updateOrderStatus(identifier: string, status: string) {
   return getOrderByIdentifier(identifier);
 }
 
-async function markOrderPaid(identifier: string, transactionRef: string) {
+// Enregistre la référence Wave déclarée par le client sans changer le statut
+// de paiement (la commande reste « en attente de validation » au backoffice).
+async function setOrderWaveRef(identifier: string, transactionRef: string) {
   if (!pool) {
     const order = await getOrderByIdentifier(identifier);
     if (order) {
-      order.paymentStatus = 'paid';
       order.waveTransactionRef = transactionRef;
       order.updatedAt = new Date().toISOString();
     }
     return;
   }
   await pool.query(
-    `UPDATE orders SET payment_status = 'paid', wave_transaction_ref = $2, updated_at = now()
+    `UPDATE orders SET wave_transaction_ref = $2, updated_at = now()
      WHERE id = $1 OR UPPER(order_number) = UPPER($1)`,
     [identifier, transactionRef]
   );
 }
-  const SELLER_INFO = {
-  name: "Mme Aminata 'Mina' Faye",
-  brand: "Mina's Food - Saveurs faites avec amour",
-  city: "Mbour",
-  address: "Quartier Grand Mbour, Face Stade Caroline Faye, Route de Saly",
-  country: "Sénégal",
-  ninea: "009842145 2V3",
-  rccm: "SN.MBR.2023.A.1420",
-  phoneWave: "+221 77 407 81 20",
-  phoneWhatsApp: "+221 77 407 81 20",
-  email: "commandes@minasfood-mbour.sn"
-};
+
+// Met à jour le statut de paiement d'une commande (validation backoffice ou
+// webhook signé). `transactionRef` optionnel complète/écrase la référence.
+async function updateOrderPayment(identifier: string, paymentStatus: string, transactionRef?: string | null) {
+  if (!pool) {
+    const order = await getOrderByIdentifier(identifier);
+    if (order) {
+      order.paymentStatus = paymentStatus;
+      if (transactionRef != null) order.waveTransactionRef = transactionRef;
+      order.updatedAt = new Date().toISOString();
+    }
+    return;
+  }
+  await pool.query(
+    `UPDATE orders SET payment_status = $2,
+       wave_transaction_ref = COALESCE($3, wave_transaction_ref), updated_at = now()
+     WHERE id = $1 OR UPPER(order_number) = UPPER($1)`,
+    [identifier, paymentStatus, transactionRef ?? null]
+  );
+  // Resynchronise la facture persistée le cas échéant.
+  const order = await getOrderByIdentifier(identifier);
+  if (order) await saveInvoice(order);
+}
+
+async function markOrderPaid(identifier: string, transactionRef: string) {
+  await updateOrderPayment(identifier, 'paid', transactionRef);
+}
+
+// ----------------------------------------------------------------------------
+// Persistance client & facture (tables customers / invoices)
+// ----------------------------------------------------------------------------
+async function upsertCustomerFromOrder(order: any) {
+  if (!pool || !order) return;
+  const phone = String(order.customerPhone || '').trim();
+  if (!phone) return;
+  try {
+    await pool.query(
+      `INSERT INTO customers (id, name, phone, email, favorite_zone, favorite_address, loyalty_points, role)
+       VALUES ($1,$2,$3,$4,$5,$6,10,'client')
+       ON CONFLICT (phone) DO UPDATE SET
+         name = EXCLUDED.name,
+         email = COALESCE(EXCLUDED.email, customers.email),
+         favorite_zone = COALESCE(EXCLUDED.favorite_zone, customers.favorite_zone),
+         favorite_address = COALESCE(EXCLUDED.favorite_address, customers.favorite_address),
+         loyalty_points = customers.loyalty_points + 10,
+         updated_at = now()`,
+      [`cus-${crypto.randomBytes(6).toString('hex')}`, order.customerName || 'Client Mina\'s Food',
+       phone, order.customerEmail || null, order.deliveryZone || null, order.deliveryAddress || null]
+    );
+  } catch (err: any) {
+    console.warn('[Clients] Enregistrement impossible :', err.message);
+  }
+}
+
+async function saveInvoice(order: any) {
+  if (!pool || !order) return;
+  try {
+    const invoice = buildInvoiceObject(order);
+    await pool.query(
+      `INSERT INTO invoices (id, invoice_number, order_id, seller_info, client_info,
+         subtotal, delivery_fee, tax_amount, total, payment_method, payment_status,
+         wave_transaction_ref, verification_code, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (id) DO UPDATE SET
+         payment_status = EXCLUDED.payment_status,
+         wave_transaction_ref = EXCLUDED.wave_transaction_ref,
+         client_info = EXCLUDED.client_info`,
+      [invoice.id, invoice.invoiceNumber, order.id, JSON.stringify(invoice.seller),
+       JSON.stringify(invoice.client), invoice.subtotal, invoice.deliveryFee,
+       invoice.taxAmount, invoice.total, invoice.paymentMethod, invoice.paymentStatus,
+       invoice.waveTransactionRef || null, invoice.verificationCode, invoice.notes || null]
+    );
+  } catch (err: any) {
+    console.warn('[Factures] Enregistrement impossible :', err.message);
+  }
+}
 
 // Helper pour générer les données de facture
 function buildInvoiceObject(order: any) {
@@ -1255,17 +1538,44 @@ app.get('/api/health', async (_req: Request, res: Response) => {
 });
 
 app.post('/api/admin/login', rateLimitedHandler((req: Request, res: Response) => {
-  const pin = String(req.body?.pin || '').trim();
-  if (!pinsMatch(pin)) {
-    return res.status(401).json({ success: false, error: 'Code administrateur incorrect.' });
+  const lockout = getAdminLockout(req);
+  if (lockout.isLocked) {
+    return res.status(429).json({
+      success: false,
+      error: `Accès temporairement bloqué. Réessayez dans ${lockout.remainingSeconds} s.`,
+      locked: true,
+      remainingSeconds: lockout.remainingSeconds,
+      attemptsLeft: 0
+    });
   }
 
+  const pin = String(req.body?.pin || '').trim();
+  if (!pinsMatch(pin)) {
+    const next = recordAdminFailure(req);
+    return res.status(next.isLocked ? 429 : 401).json({
+      success: false,
+      error: next.isLocked
+        ? 'Trop de tentatives. Le backoffice est temporairement verrouillé pendant 60 secondes.'
+        : `Code d’accès incorrect. Il vous reste ${next.attemptsLeft} tentative(s).`,
+      locked: next.isLocked,
+      remainingSeconds: next.remainingSeconds,
+      attemptsLeft: next.attemptsLeft
+    });
+  }
+
+  resetAdminFailures(req);
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
   adminSessions.set(token, expiresAt);
   persistAdminSessions();
   res.json({ success: true, token, expiresAt });
 }, { max: 10 }));
+
+// Vérifie qu'un jeton de session existant est toujours valide (restauration
+// de session au rechargement, sans redemander le PIN).
+app.get('/api/admin/session', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, authenticated: true });
+});
 
 // 1.2 Liste des commandes
 app.get('/api/orders', requireAdmin, async (_req: Request, res: Response) => {
@@ -1379,6 +1689,51 @@ app.patch('/api/orders/:orderId/status', requireAdmin, async (req: Request, res:
         status === 'delivered' ? 'Livré au client' : 'Reçue'
       }"`,
       type: 'status',
+      orderNumber: order.orderNumber,
+      url: '/'
+    });
+
+    res.json({ success: true, order });
+  } catch (err: any) {
+    res.status(503).json({ success: false, error: `Base de données indisponible : ${err.message}` });
+  }
+});
+
+// 1.6 Validation manuelle du paiement d'une commande (backoffice).
+// Le backoffice vérifie dans l'app Wave puis confirme ici : c'est le canal
+// qui passe réellement une commande en « payé » avec le lien commercial.
+app.patch('/api/orders/:orderId/payment', requireAdmin, async (req: Request, res: Response) => {
+  const { orderId } = req.params;
+  const { paymentStatus, waveTransactionRef } = req.body;
+  const allowed = ['pending', 'paid', 'failed', 'refunded'];
+
+  if (!allowed.includes(paymentStatus)) {
+    return res.status(400).json({ success: false, error: 'Statut de paiement invalide.' });
+  }
+
+  try {
+    const reference = waveTransactionRef != null ? String(waveTransactionRef).trim().toUpperCase() : undefined;
+    await updateOrderPayment(orderId, paymentStatus, reference);
+    const order = await getOrderByIdentifier(orderId);
+    if (!order) {
+      return res.status(404).json({ success: false, error: 'Commande introuvable.' });
+    }
+
+    broadcastRealtimeEvent('payment:verified', {
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      paymentStatus,
+      waveTransactionRef: order.waveTransactionRef || null,
+      updatedAt: order.updatedAt,
+      message: paymentStatus === 'paid'
+        ? `Paiement de la commande ${order.orderNumber} validé par la boutique.`
+        : `Statut de paiement de ${order.orderNumber} : ${paymentStatus}.`
+    }, {
+      title: `Paiement ${paymentStatus === 'paid' ? 'validé' : 'mis à jour'} - ${order.orderNumber}`,
+      message: paymentStatus === 'paid'
+        ? `Votre paiement Wave a été confirmé pour la commande ${order.orderNumber}.`
+        : `Statut de paiement de la commande ${order.orderNumber} : ${paymentStatus}.`,
+      type: 'wave',
       orderNumber: order.orderNumber,
       url: '/'
     });
@@ -1579,23 +1934,16 @@ function recordWaveRef(normalizedRef: string, orderId: string) {
   processedWaveRefs.set(normalizedRef, orderId);
 }
 
-function respondWaveVerified(res: Response, normalizedRef: string, amount: number | null, alreadyVerified: boolean) {
-  res.json({
-    success: true,
-    verified: true,
-    alreadyVerified,
-    waveTransactionRef: normalizedRef,
-    merchantName: "Mina's Food Mbour",
-    merchantPhone: SELLER_INFO.phoneWave,
-    amount,
-    verifiedAt: new Date().toISOString(),
-    message: alreadyVerified
-      ? 'Ce paiement Wave a déjà été certifié pour cette commande.'
-      : 'Paiement Wave certifié avec succès sur le compte marchand.'
-  });
+interface WaveResolveResult {
+  error?: string;
+  status?: number;
+  order?: any;
+  existingOwner?: string;
 }
 
-async function certifyWavePayment(orderId: string, normalizedRef: string, amount: number | null) {
+// Vérification de base commune : commande existante + montant cohérent +
+// référence non réutilisée sur une autre commande.
+async function resolveWavePayment(orderId: string, normalizedRef: string, amount: number | null): Promise<WaveResolveResult> {
   const order = orderId ? await getOrderByIdentifier(orderId) : null;
   if (orderId && !order) {
     return { error: 'Commande introuvable pour ce paiement.', status: 404 };
@@ -1603,17 +1951,68 @@ async function certifyWavePayment(orderId: string, normalizedRef: string, amount
   if (order && amount != null && Number(amount) !== Number(order.total)) {
     return { error: 'Le montant du paiement ne correspond pas à la commande.', status: 422 };
   }
-
-  // Idempotence : si la référence a déjà certifié cette commande, on renvoie le cache.
   const existingOwner = await getWaveRefOwner(normalizedRef);
-  const alreadyVerified = existingOwner === orderId || order?.paymentStatus === 'paid';
+  if (existingOwner && existingOwner !== orderId) {
+    return { error: 'Cette référence Wave a déjà été utilisée pour une autre commande.', status: 422 };
+  }
+  return { order, existingOwner };
+}
 
-  if (!alreadyVerified) {
-    // Interdire de réutiliser une référence sur une autre commande.
-    if (existingOwner && existingOwner !== orderId) {
-      return { error: 'Cette référence Wave a déjà été utilisée pour une autre commande.', status: 422 };
+// Modèle retenu avec le lien commercial Wave : le client DÉCLARE une référence,
+// le paiement reste « en attente de validation ». Le paiement n'est marqué
+// « payé » que par le backoffice (après vérification dans l'app Wave) ou par le
+// webhook signé.
+async function declareWavePayment(
+  orderId: string,
+  normalizedRef: string,
+  amount: number | null
+): Promise<{ error?: string; status?: number; order?: any; alreadyDeclared: boolean }> {
+  const resolved = await resolveWavePayment(orderId, normalizedRef, amount);
+  if (resolved.error) return { error: resolved.error, status: resolved.status, alreadyDeclared: false };
+  const { order, existingOwner } = resolved;
+
+  const alreadyDeclared = existingOwner === orderId && order?.waveTransactionRef === normalizedRef;
+  if (!alreadyDeclared) {
+    if (orderId) {
+      try {
+        await setOrderWaveRef(orderId, normalizedRef);
+      } catch (err: any) {
+        console.warn('[Wave] Impossible d’enregistrer la référence :', err.message);
+      }
     }
+    recordWaveRef(normalizedRef, orderId || '');
 
+    broadcastRealtimeEvent('payment:declared', {
+      waveTransactionRef: normalizedRef,
+      orderId: orderId || null,
+      amount: amount || null,
+      orderNumber: order?.orderNumber || null,
+      declaredAt: new Date().toISOString(),
+      message: `Paiement Wave déclaré (${normalizedRef}) — à valider au backoffice`
+    }, {
+      title: 'Paiement Wave à valider',
+      message: `Référence ${normalizedRef} déclarée${order?.orderNumber ? ` pour ${order.orderNumber}` : ''}. Vérifiez dans votre app Wave.`,
+      type: 'wave',
+      orderNumber: order?.orderNumber || null,
+      url: '/admin'
+    });
+  }
+
+  return { order, alreadyDeclared };
+}
+
+// Certification fiable (webhook signé Wave Business uniquement).
+async function certifyWavePayment(
+  orderId: string,
+  normalizedRef: string,
+  amount: number | null
+): Promise<{ error?: string; status?: number; order?: any; alreadyVerified: boolean }> {
+  const resolved = await resolveWavePayment(orderId, normalizedRef, amount);
+  if (resolved.error) return { error: resolved.error, status: resolved.status, alreadyVerified: false };
+  const { order } = resolved;
+
+  const alreadyVerified = order?.paymentStatus === 'paid';
+  if (!alreadyVerified) {
     if (orderId) {
       try {
         await markOrderPaid(orderId, normalizedRef);
@@ -1621,10 +2020,8 @@ async function certifyWavePayment(orderId: string, normalizedRef: string, amount
         console.warn('[Wave] Impossible de marquer la commande payée en base :', err.message);
       }
     }
-
     recordWaveRef(normalizedRef, orderId || '');
 
-    // Diffusion temps réel du paiement Wave certifié
     broadcastRealtimeEvent('payment:verified', {
       waveTransactionRef: normalizedRef,
       orderId: orderId || null,
@@ -1644,7 +2041,9 @@ async function certifyWavePayment(orderId: string, normalizedRef: string, amount
   return { order, alreadyVerified };
 }
 
-// 3.1 Vérification manuelle depuis l'interface client (idempotente)
+// 3.1 Déclaration d'un paiement depuis l'interface client (le lien commercial
+//     Wave ayant été utilisé). Non autoritatif : enregistre la référence et
+//     laisse la commande en attente de validation par le backoffice.
 app.post('/api/wave/verify', rateLimitedHandler(async (req: Request, res: Response) => {
   const { transactionRef, orderId, amount } = req.body;
 
@@ -1665,11 +2064,22 @@ app.post('/api/wave/verify', rateLimitedHandler(async (req: Request, res: Respon
     });
   }
 
-  const result = await certifyWavePayment(orderId, normalizedRef, amount != null ? Number(amount) : null);
+  const result = await declareWavePayment(orderId, normalizedRef, amount != null ? Number(amount) : null);
   if (result.error) {
-    return res.status(result.status!).json({ success: false, error: result.error });
+    return res.status(result.status || 500).json({ success: false, error: result.error });
   }
-  respondWaveVerified(res, normalizedRef, amount != null ? Number(amount) : null, Boolean(result.alreadyVerified));
+  res.json({
+    success: true,
+    verified: false,
+    declared: true,
+    pendingValidation: true,
+    alreadyDeclared: Boolean(result.alreadyDeclared),
+    waveTransactionRef: normalizedRef,
+    merchantName: "Mina's Food Mbour",
+    merchantPhone: SELLER_INFO.phoneWave,
+    amount: amount != null ? Number(amount) : null,
+    message: 'Référence Wave enregistrée. Le paiement sera validé par la boutique après vérification.'
+  });
 }, { max: 30 }));
 
 // 3.2 Webhook Wave Business Server-to-Server (optionnel mais conseillé)
@@ -1704,7 +2114,7 @@ app.post('/api/wave/webhook', rateLimitedHandler(async (req: Request, res: Respo
   const normalizedRef = String(transactionRef).trim().toUpperCase();
   const result = await certifyWavePayment(identifier, normalizedRef, amount != null ? Number(amount) : null);
   if (result.error) {
-    return res.status(result.status!).json({ success: false, error: result.error });
+    return res.status(result.status || 500).json({ success: false, error: result.error });
   }
   res.json({ success: true, verified: true, received: true, alreadyVerified: Boolean(result.alreadyVerified) });
 }, { max: 60 }));
@@ -1813,7 +2223,35 @@ app.get('/api/events/stream', rateLimitedHandler(async (req: Request, res: Respo
   })}\n\n`);
 
   sseClients.add(res);
+
+  // Battement de cœur pour traverser les proxys (et détecter les coupures).
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: ping ${Date.now()}\n\n`);
+    } catch {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    }
+  }, 15_000);
+
+  // En serverless, la durée max d'une fonction coupe la connexion : on referme
+  // proprement juste avant, EventSource se reconnecte automatiquement (retry).
+  const maxLifetime = IS_VERCEL ? 50_000 : 0;
+  const lifetimeTimer = maxLifetime
+    ? setTimeout(() => {
+        try {
+          res.write(`event: connection:refresh\ndata: ${JSON.stringify({ event: 'connection:refresh', data: { reason: 'reconnect' }, timestamp: new Date().toISOString() })}\n\n`);
+          res.end();
+        } catch {
+          // déjà fermé
+        }
+        sseClients.delete(res);
+      }, maxLifetime)
+    : null;
+
   req.on('close', () => {
+    clearInterval(heartbeat);
+    if (lifetimeTimer) clearTimeout(lifetimeTimer);
     sseClients.delete(res);
     res.end();
   });

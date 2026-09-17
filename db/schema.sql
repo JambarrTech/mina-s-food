@@ -199,7 +199,8 @@ CREATE TABLE IF NOT EXISTS invoices (
   verification_code   text,                   -- VERIF-XXXX-XXXX
   notes               text,
   issued_at           timestamptz NOT NULL DEFAULT now(),
-  created_at          timestamptz NOT NULL DEFAULT now()
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_invoices_order ON invoices (order_id);

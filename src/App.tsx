@@ -11,7 +11,7 @@
  * - Espace Backoffice d'administration pour Mina et son équipe en laboratoire.
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Product, 
   Order, 
@@ -69,6 +69,12 @@ export default function App() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string>('');
 
+  // Nouvelle tentative automatique en cas de panne transitoire (DNS, Neon
+  // en réveil, cold start serverless) : au plus 4 relances avec backoff.
+  const nbTentatives = useRef(0);
+  const chargementEnCours = useRef(false);
+  const minuteurNouvelleTentative = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Le backoffice est accessible uniquement par l'URL dédiée /admin.
   const isAdminRoute = window.location.pathname === '/admin' || window.location.pathname.startsWith('/admin/');
 
@@ -103,6 +109,12 @@ export default function App() {
 
   // Chargement initial des données de la pâtisserie
   const rafraichirDonnees = async () => {
+    if (minuteurNouvelleTentative.current !== null) {
+      clearTimeout(minuteurNouvelleTentative.current);
+      minuteurNouvelleTentative.current = null;
+    }
+    if (chargementEnCours.current) return;
+    chargementEnCours.current = true;
     try {
       const [prods, ords, zones, params] = await Promise.all([
         chargerProduits(),
@@ -110,16 +122,26 @@ export default function App() {
         chargerZonesLivraison(),
         chargerParametres()
       ]);
+      nbTentatives.current = 0;
       setProducts(prods);
       setOrders(ords);
       setDeliveryZones(zones);
       setSettings(params);
       setLoadError('');
+      setIsLoading(false);
     } catch (err: any) {
       console.error("Erreur de synchronisation :", err);
-      setLoadError(err?.message || 'Impossible de charger les données de la boutique.');
+      if (nbTentatives.current < 4) {
+        nbTentatives.current += 1;
+        const delaiMs = 2000 * nbTentatives.current;
+        minuteurNouvelleTentative.current = setTimeout(() => rafraichirDonnees(), delaiMs);
+      } else {
+        nbTentatives.current = 0;
+        setLoadError(err?.message || 'Impossible de charger les données de la boutique.');
+        setIsLoading(false);
+      }
     } finally {
-      setIsLoading(false);
+      chargementEnCours.current = false;
     }
   };
 

@@ -1,39 +1,38 @@
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  getAdminPin,
-  isValidAdminPin,
-  checkBruteForceLockout,
-  recordFailedLoginAttempt,
-  resetFailedLoginAttempts
+  validateSenegalesePhone,
+  sanitizeInput
 } from '../src/utils/securityUtils.ts';
 
 describe('admin security utilities', () => {
-  beforeEach(() => {
-    process.env.ADMIN_PIN = 'mina2026';
-    delete process.env.VITE_ADMIN_PIN;
-    resetFailedLoginAttempts();
+  it('valide et formate un numéro sénégalais', () => {
+    const result = validateSenegalesePhone('77 407 81 20');
+    assert.equal(result.isValid, true);
+    assert.equal(result.formatted, '+221 77 407 81 20');
+    assert.equal(result.carrier, 'Orange / Wave');
   });
 
-  it('uses the configured admin pin when provided', () => {
-    process.env.VITE_ADMIN_PIN = 'mbo-2026';
-    assert.equal(getAdminPin(), 'mbo-2026');
-    assert.equal(isValidAdminPin('mbo-2026'), true);
-    assert.equal(isValidAdminPin('mina2026'), false);
+  it('accepte le préfixe international +221', () => {
+    const result = validateSenegalesePhone('+221 78 123 45 67');
+    assert.equal(result.isValid, true);
+    assert.equal(result.formatted, '+221 78 123 45 67');
   });
 
-  it('locks after repeated failures', () => {
-    const first = recordFailedLoginAttempt();
-    const second = recordFailedLoginAttempt();
-    const third = recordFailedLoginAttempt();
-    const fourth = recordFailedLoginAttempt();
-    const fifth = recordFailedLoginAttempt();
+  it('rejette un préfixe non reconnu', () => {
+    const result = validateSenegalesePhone('72 123 45 67');
+    assert.equal(result.isValid, false);
+  });
 
-    assert.equal(first.attemptsLeft, 4);
-    assert.equal(second.attemptsLeft, 3);
-    assert.equal(third.attemptsLeft, 2);
-    assert.equal(fourth.attemptsLeft, 1);
-    assert.equal(fifth.isLocked, true);
-    assert.equal(checkBruteForceLockout().isLocked, true);
+  it('neutralise les balises et hooks XSS', () => {
+    const cleaned = sanitizeInput('<img src=x onerror=alert(1)>javascript:evil');
+    assert.equal(cleaned.includes('<'), false);
+    assert.equal(cleaned.includes('>'), false);
+    assert.equal(/on\w+=/i.test(cleaned), false);
+    assert.equal(/javascript:/i.test(cleaned), false);
+  });
+
+  it('tronque les entrées à la longueur maximale', () => {
+    assert.equal(sanitizeInput('a'.repeat(50), 10).length, 10);
   });
 });

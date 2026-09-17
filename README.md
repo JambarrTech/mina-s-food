@@ -26,7 +26,8 @@ Application de boutique pâtisserie artisanale pour Mbour, Sénégal, avec catal
 La configuration minimale est :
 
 - `DATABASE_URL` : URL PostgreSQL de ton instance Neon ou locale
-- `VITE_ADMIN_PIN` : code PIN d’accès au backoffice (par défaut : `mina2026`)
+- `ADMIN_PIN` : code PIN d’accès au backoffice, **strictement côté serveur** (par défaut : `mina2026`). Ne jamais utiliser `VITE_ADMIN_PIN` en production : toute variable préfixée `VITE_` est embarquée dans le bundle navigateur.
+- `ALLOWED_ORIGINS` (optionnel) : origines autorisées en CORS, séparées par des virgules
 - `VITE_WAVE_PAYMENT_LINK` : lien commercial Wave qui sera ouvert au client
 - `WAVE_WEBHOOK_SECRET` (optionnel) : secret HMAC-SHA256 qui authentifie les appels du webhook Wave vers `/api/wave/webhook`
 - `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VITE_VAPID_PUBLIC_KEY` (optionnel) : clés Web Push pour les notifications natives de navigateur
@@ -36,7 +37,7 @@ Exemple :
 
 ```env
 DATABASE_URL=postgresql://user:password@host:5432/minasfood
-VITE_ADMIN_PIN=mina2026
+ADMIN_PIN=mina2026
 VITE_WAVE_PAYMENT_LINK=https://pay.wave.com/m/REMPLACE_PAR_TON_LIEN
 WAVE_WEBHOOK_SECRET=REMPLACE_PAR_UN_SECRET_LONG
 VAPID_PUBLIC_KEY=REMPLACE_PAR_TA_CLE_PUBLIQUE
@@ -56,9 +57,20 @@ Si `DATABASE_URL` est absente ou vide, le projet passe automatiquement en mode d
 
 ## Sécurité
 
-Le backoffice est protégé par un PIN configurable côté interface et par une session temporaire côté API (persistée sur disque en local et synchronisée en base Neon en serverless). Les opérations d’administration exigent un token serveur. En cas de tentatives répétées, un verrouillage temporaire de 60 secondes est activé.
+Le backoffice est protégé par un PIN **jamais exposé au navigateur** : l’authentification et le verrouillage anti-bruteforce (5 tentatives, blocage 60 s) sont gérés côté serveur. Les opérations d’administration exigent un token de session serveur (persisté sur disque en local et en base Neon en serverless).
 
-Les endpoints publics sont protégés par un limiteur de débit par adresse IP (anti-spam et anti-abus de requêtes). Les références de paiement Wave sont certifiées de façon idempotente : une même référence ne peut pas être réutilisée sur deux commandes. En production, active `WAVE_WEBHOOK_SECRET` pour permettre à Wave de confirmer les paiements de façon serveur-à-serveur et de manière signée.
+Les endpoints publics sont protégés par un limiteur de débit par adresse IP, **persisté en base Neon** (table `rate_limits`) pour rester efficace entre les instances serverless, avec repli mémoire si la base est indisponible.
+
+Les frais de livraison sont **recalculés côté serveur** à partir de la zone active : le client ne peut pas les modifier. Le retrait en boutique est toujours gratuit.
+
+### Paiement Wave
+
+Avec le **lien commercial Wave**, aucune vérification automatique serveur-à-serveur n’est possible. Le modèle retenu est donc :
+
+1. Le client ouvre le lien commercial Wave, paie, puis déclare sa référence (`POST /api/wave/verify`). La commande reste **en attente**.
+2. Mina vérifie le paiement dans son application Wave puis le confirme dans le backoffice (`PATCH /api/orders/:id/payment`), qui passe la commande en `paid` et synchronise la facture.
+
+Une référence Wave ne peut jamais être réutilisée sur deux commandes (index unique). Si tu disposes d’un compte **Wave Business**, configure `WAVE_WEBHOOK_SECRET` pour que Wave certifie automatiquement les paiements via un webhook signé HMAC-SHA256 (`/api/wave/webhook`), sans intervention manuelle.
 
 Les prix sont exprimés en entiers FCFA : le Franc CFA est une monnaie sans centimes, ce choix garantit donc une précision exacte, conforme au système monétaire sénégalais.
 
@@ -92,7 +104,7 @@ L'application est prête pour Vercel + Neon (PostgreSQL serverless). Le mode est
 | Variable | Exemple / Valeur |
 |---|---|
 | `DATABASE_URL` | `postgresql://...@ep-xxx.neon.tech/neondb?sslmode=require` |
-| `ADMIN_PIN` / `VITE_ADMIN_PIN` | `mina2026` (ou un secret fort) |
+| `ADMIN_PIN` | `mina2026` (ou un secret fort, côté serveur uniquement) |
 | `VAPID_PUBLIC_KEY` | `BD8yCmu__eyk...` |
 | `VAPID_PRIVATE_KEY` | `0chfB96RE...` |
 | `VITE_VAPID_PUBLIC_KEY` | (identique à `VAPID_PUBLIC_KEY`, exposée au client) |

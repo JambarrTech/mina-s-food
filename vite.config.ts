@@ -8,7 +8,9 @@ export default defineConfig(() => {
   return {
     plugins: [react(), tailwindcss(), vercel()],
     vercel: {
-      defaultMaxDuration: 30,
+      // SSE : la connexion se referme volontairement à ~50 s côté serveur puis
+      // EventSource se reconnecte, ce qui reste sous cette durée max.
+      defaultMaxDuration: 60,
       defaultSupportsResponseStreaming: true,
       rewrites: [
         {source: '/api/:path*', destination: '/api/:path*'},

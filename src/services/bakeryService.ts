@@ -32,6 +32,28 @@ export async function authentifierAdmin(pin: string): Promise<void> {
   sessionStorage.setItem(ADMIN_TOKEN_KEY, data.token);
 }
 
+export function deconnecterAdmin(): void {
+  sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+}
+
+/**
+ * Vérifie qu'un jeton de session existant est toujours valide (restauration
+ * de session au rechargement de la page, sans redemander le PIN).
+ */
+export async function verifierSessionAdmin(): Promise<boolean> {
+  if (!sessionStorage.getItem(ADMIN_TOKEN_KEY)) return false;
+  try {
+    const response = await fetch('/api/admin/session', { headers: getAdminAuthHeaders() });
+    if (!response.ok) {
+      sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function requeteApi<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...getAdminAuthHeaders(), ...options?.headers },
@@ -105,6 +127,21 @@ export async function mettreAJourStatutCommande(
   await requeteApi(`/api/orders/${encodeURIComponent(commandeId)}/status`, {
     method: 'PATCH',
     body: JSON.stringify({ status: nouveauStatut })
+  });
+}
+
+/**
+ * Validation manuelle du paiement d'une commande par le backoffice, après
+ * vérification dans l'application Wave (modèle du lien commercial).
+ */
+export async function validerPaiementCommande(
+  commandeId: string,
+  paymentStatus: 'pending' | 'paid' | 'failed' | 'refunded',
+  waveTransactionRef?: string
+): Promise<void> {
+  await requeteApi(`/api/orders/${encodeURIComponent(commandeId)}/payment`, {
+    method: 'PATCH',
+    body: JSON.stringify({ paymentStatus, waveTransactionRef })
   });
 }
 

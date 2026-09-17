@@ -158,7 +158,7 @@ class RealtimeService {
         this.emit('connection:status', { connected: false, mode: 'sse' });
       };
 
-      const namedEvents = ['order:created', 'order:status_updated', 'payment:verified', 'notification:broadcast', 'connection:established'];
+      const namedEvents = ['order:created', 'order:status_updated', 'payment:verified', 'payment:declared', 'notification:broadcast', 'connection:established'];
       for (const eventName of namedEvents) {
         sse.addEventListener(eventName, (raw: Event) => {
           try {
@@ -236,6 +236,16 @@ class RealtimeService {
         type: 'wave',
         timestamp: timestamp || new Date().toISOString(),
         orderNumber: data.orderId
+      });
+    } else if (event === 'payment:declared') {
+      soundManager.playPaymentChime();
+      this.addNotification({
+        id: `notif-${Date.now()}`,
+        title: 'Paiement Wave à valider',
+        message: data.message || `Référence ${data.waveTransactionRef} déclarée pour vérification.`,
+        type: 'wave',
+        timestamp: timestamp || new Date().toISOString(),
+        orderNumber: data.orderNumber
       });
     } else if (event === 'notification:broadcast') {
       soundManager.playOrderChime();
