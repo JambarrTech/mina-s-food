@@ -2,7 +2,19 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig} from 'vite';
-import vercel from 'vite-plugin-vercel';
+import vercel, {type VercelOutputConfig} from 'vite-plugin-vercel';
+
+type VercelRoute = NonNullable<VercelOutputConfig['routes']>[number];
+
+// Routage du Build Output API aligné sur l'ancienne config manuelle qui
+// fonctionnait : /api/* -> fonction servie sous /api, tout le reste ->
+// index.html (SPA). Le routage par défaut du plugin (dest '/api/$1' avec
+// check:true) ne joignait pas la fonction sur Vercel.
+const vercelRoutes: VercelRoute[] = [
+  {handle: 'filesystem'},
+  {src: '/api/(.*)', dest: '/api'},
+  {src: '/(.*)', dest: '/index.html'},
+];
 
 export default defineConfig(() => {
   return {
@@ -12,10 +24,9 @@ export default defineConfig(() => {
       // EventSource se reconnecte, ce qui reste sous cette durée max.
       defaultMaxDuration: 60,
       defaultSupportsResponseStreaming: true,
-      rewrites: [
-        {source: '/api/:path*', destination: '/api/:path*'},
-        {source: '/:path*', destination: '/index.html'},
-      ],
+      config: {
+        routes: vercelRoutes,
+      },
     },
     resolve: {
       alias: {
